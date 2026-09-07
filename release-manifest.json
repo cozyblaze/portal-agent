@@ -78,8 +78,8 @@
     },
     {
       "path": "evidence/README.md",
-      "bytes": 2253,
-      "sha256": "7d64931af37a2e1f9cb8e2153e984c60889d38576dc6352fa0a6a7d928a86862"
+      "bytes": 2220,
+      "sha256": "ea02fa1353d33571d1dffd934c5db2abc403cd5dffd65c52188e8ea13fdd99af"
     },
     {
       "path": "evidence/session.sanitized.jsonl",
