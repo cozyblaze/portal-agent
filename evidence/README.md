@@ -6,7 +6,7 @@ Download [session.sanitized.jsonl](session.sanitized.jsonl) and open it in a tex
 
 ## Timeline
 
-All clock times use **San Francisco time — PDT (UTC−7)**, including when viewed elsewhere.
+All clock times use **San Francisco time — PDT (UTC−7)**.
 
 | Event | Time |
 | --- | --- |
