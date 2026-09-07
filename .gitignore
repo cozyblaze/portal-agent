@@ -1,0 +1,24 @@
+# Generated machine-specific setup and local builds
+.local/
+node_modules/
+build/
+out/
+.env
+.env.*
+!.env.example
+*.log
+*.dll
+*.exe
+*.pdb
+*.sav
+*.dem
+*.vpk
+*.bsp
+*.zip
+rollout-*.jsonl
+**/.codex/config.toml
+**/.codex/hooks.json
+**/.claude/
+# Only the reviewed public derivative belongs in Git.
+*.jsonl
+!evidence/session.sanitized.jsonl

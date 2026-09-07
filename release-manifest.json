@@ -1,0 +1,180 @@
+{
+  "version": 1,
+  "files": [
+    {
+      "path": ".gitattributes",
+      "bytes": 72,
+      "sha256": "3e2e9e6ce8ac68cdbc7b1194abdc39418d1384dda081e570ff71fe23f6c395eb"
+    },
+    {
+      "path": ".gitignore",
+      "bytes": 333,
+      "sha256": "46ffa8df96f8160d33253c1313f6105771261bdf93383d1b4ec048b96fa9fb9e"
+    },
+    {
+      "path": "controller/index.mjs",
+      "bytes": 41705,
+      "sha256": "c94ab41657b6217856033a0f317d3f35d65dac44d983424f7f41e76440362c79"
+    },
+    {
+      "path": "controller/index.test.mjs",
+      "bytes": 37008,
+      "sha256": "1e0970d8372450beb479301089e7b1ef7994b32a3dc2a63fcc6ee517171360b6"
+    },
+    {
+      "path": "controller/LICENSE",
+      "bytes": 1066,
+      "sha256": "ca065b10dc2cd76ac42dbc938c2488ca9e3f124de2bc9589210c7d39d073f86b"
+    },
+    {
+      "path": "controller/mcp/hardening.mjs",
+      "bytes": 7861,
+      "sha256": "54835a47ed35b66b0cdd2aaed7af97ca3f4b80634b2c981b90eb9081fa04154c"
+    },
+    {
+      "path": "controller/mcp/portal-documentation.md",
+      "bytes": 7462,
+      "sha256": "562cd0c7a3a2e3c463f163c715de68a3545e7f712364e4d8dbad32c0eded6746"
+    },
+    {
+      "path": "controller/mcp/portal-mcp-server.mjs",
+      "bytes": 13841,
+      "sha256": "baf013f2284f26c3e3b763897c26a131c232eb743453ec9f19569becc14981ef"
+    },
+    {
+      "path": "controller/package.json",
+      "bytes": 216,
+      "sha256": "6216d34cb36a5cbc384488566367e32700b0d573e65f94c311f5e1376552457c"
+    },
+    {
+      "path": "controller/scripts/compact-demo.mjs",
+      "bytes": 8652,
+      "sha256": "ff276949b9320842fb76c3d82ef3ca94f093234ad595ff438aa20a9925344b8d"
+    },
+    {
+      "path": "controller/scripts/manual-test.mjs",
+      "bytes": 5964,
+      "sha256": "6ed1ba6afb427e09b658d4097b0ed4d63c767f558bf9f05d251394ac85f71834"
+    },
+    {
+      "path": "controller/scripts/portal-client.mjs",
+      "bytes": 1743,
+      "sha256": "8fd282c2255313c1f6ba3306c617edb21ec3b81a71c6170a38ec06235ed7674a"
+    },
+    {
+      "path": "docs/how-it-works.md",
+      "bytes": 2353,
+      "sha256": "9e47e87a0f9b2274cc7d314292e31fb44a18eeceb89f8c4f0eb1b7716117a2d5"
+    },
+    {
+      "path": "docs/publication.md",
+      "bytes": 1041,
+      "sha256": "dd190e1118bb5d27beba9cd96a2b296a21a9a7e6b49dbd0df2ffb5a4be95186e"
+    },
+    {
+      "path": "docs/setup.md",
+      "bytes": 6489,
+      "sha256": "07abe01845a330511f5e5ee7894f6258c6334e937eaf2d01935979c72d395487"
+    },
+    {
+      "path": "evidence/README.md",
+      "bytes": 2253,
+      "sha256": "7d64931af37a2e1f9cb8e2153e984c60889d38576dc6352fa0a6a7d928a86862"
+    },
+    {
+      "path": "evidence/session.sanitized.jsonl",
+      "bytes": 2930693,
+      "sha256": "01124626012d775df4a79a3ce42fc46f74cb715f0014d3057984d49000380c28"
+    },
+    {
+      "path": "evidence/summary.json",
+      "bytes": 1620,
+      "sha256": "c8b58cd6963b01fc3c32325d3cf4a33b00e5051eaec9a5315b72c8ec17c379c1"
+    },
+    {
+      "path": "game-config/agent_run.cfg",
+      "bytes": 319,
+      "sha256": "90a7f7e4ce311a8343bf04fc2578f9aa8983dbd549aad78ff626b00208b1384f"
+    },
+    {
+      "path": "game-config/autoexec.cfg",
+      "bytes": 225,
+      "sha256": "b14e59b64367c6304fce06e2c193c4f0b921e22770fc150d5787e24fb679e439"
+    },
+    {
+      "path": "game-config/spt.vdf",
+      "bytes": 28,
+      "sha256": "50e49c5dd0f7b4e776961ad09a816f259593cc601d12ae29d77c911cd4c133ab"
+    },
+    {
+      "path": "README.md",
+      "bytes": 2258,
+      "sha256": "9eb4468e951f8b224358a76d888b18d4c8bf27b07bbba1481b4abe6ed61832ff"
+    },
+    {
+      "path": "run/AGENTS.md",
+      "bytes": 1791,
+      "sha256": "19fa76e51e79905cce8e7546a0d38a55833c92dfb5497aa927da5bcd5c3204b6"
+    },
+    {
+      "path": "run/config.template.toml",
+      "bytes": 1915,
+      "sha256": "74f87d00974c0b04a60ad2ce65a7698cadd113c0a25764a536ca41c082d1ae61"
+    },
+    {
+      "path": "spt/LICENSE",
+      "bytes": 11084,
+      "sha256": "23c6fdca9b216878c575bea45376b16b40998c021b553c3ecd6b9d4dcc7d155b"
+    },
+    {
+      "path": "spt/NOTICE",
+      "bytes": 607,
+      "sha256": "5eeaae0e000a10d19382cda1f9ad378606d2b2b5e760d7f8f6c0950cd73cc7ee"
+    },
+    {
+      "path": "spt/portal-agent.patch",
+      "bytes": 71852,
+      "sha256": "790198cbfedc2a5a8b510582f426ad77aa7cc41113c2fdc04203145beb70cbe4"
+    },
+    {
+      "path": "spt/UPSTREAM.json",
+      "bytes": 721,
+      "sha256": "609850762bf6ce9e146cbdfceaa4c70d5dab1fea78dcb23d6ab02325ba2e98a5"
+    },
+    {
+      "path": "tools/build-spt.ps1",
+      "bytes": 2572,
+      "sha256": "95109f2e6a66e91647e791a85ae76f0e08bc75b93e1f5756e0e08608383a1527"
+    },
+    {
+      "path": "tools/check-connection.mjs",
+      "bytes": 6475,
+      "sha256": "446ed7b87145455adf1abd2b86459278adbabe12db2aa5fe53053235cd0c29e3"
+    },
+    {
+      "path": "tools/configure-run.mjs",
+      "bytes": 1327,
+      "sha256": "7c2623a8e383deb1c3ef5b6ec2e8c9c71ba122618a7a77bad4131b7a5373653f"
+    },
+    {
+      "path": "tools/export-session.mjs",
+      "bytes": 6813,
+      "sha256": "93c0aa6d2a4e91cb1a0fafa820e05138112ac46f6a65221ba0c7c3fdffc7f7a1"
+    },
+    {
+      "path": "tools/pacific-time.mjs",
+      "bytes": 627,
+      "sha256": "48b1f81cdaa8d2596b22fb93519d599e0e381e788d532ce9691e71d6c92164bf"
+    },
+    {
+      "path": "tools/prepare-spt.ps1",
+      "bytes": 1083,
+      "sha256": "1e357145c378c306df48b407330525de6b6b1e8ce4ac8bb92c84675aee486a87"
+    },
+    {
+      "path": "tools/scan-publication.mjs",
+      "bytes": 2905,
+      "sha256": "0743b68fea172faff3425647621d81c196eef01680f3956b47208a2f35bb276f"
+    }
+  ]
+}

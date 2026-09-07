@@ -1,0 +1,47 @@
+{
+  "schema_version": 2,
+  "time_zone": "America/Los_Angeles",
+  "run_dates": "2026-09-04 to 2026-09-05",
+  "started_at": "2026-09-04T17:00:35.319-07:00",
+  "completed_at": "2026-09-05T16:43:09.601-07:00",
+  "ended_at": "2026-09-05T16:47:59.243-07:00",
+  "models": [
+    {
+      "model": "gpt-6-astra",
+      "reasoning_effort": "max"
+    }
+  ],
+  "source_records": 26460,
+  "exported_records": 6925,
+  "omitted_records": 19535,
+  "removed_images": 3263,
+  "redactions": {
+    "identifier": 21
+  },
+  "elapsed_to_completion_seconds": 85354,
+  "elapsed_including_post_completion_seconds": 85644,
+  "last_reported_thread_token_usage": {
+    "input_tokens": 433210793,
+    "cached_input_tokens": 426415104,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 1598341,
+    "reasoning_output_tokens": 1181102,
+    "total_tokens": 434809134
+  },
+  "tool_methods_in_exec": {
+    "create_goal": 1,
+    "get_goal": 20,
+    "mcp__portal__portal_documentation": 13,
+    "mcp__portal__portal_screenshot": 40,
+    "mcp__portal__portal_exec": 3210,
+    "get_context_remaining": 21,
+    "update_goal": 1
+  },
+  "export_notes": [
+    "Sanitized text export of run messages, tool calls, and results.",
+    "Timestamps use San Francisco time (America/Los_Angeles), with an explicit UTC offset; elapsed seconds are durations.",
+    "Host/system/developer context, world state, context-compaction/history/note tool records, reasoning payloads, opaque data and original identifiers are omitted.",
+    "Embedded images are omitted from this text release.",
+    "Token counts are cumulative reported usage and include cached input."
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/OutOfBoundsOffice/SourcePauseTool.git",
+  "base_commit": "3dfdd68314a9a47e2dc969706234814eacbf9cc7",
+  "local_snapshot_commit": "e21b40d696b7754919353ffcf5d45803bb853371",
+  "includes_uncommitted_changes": true,
+  "snapshot_date": "2026-09-06",
+  "snapshot_time_zone": "America/Los_Angeles",
+  "sptlib_commit": "621c0516af17c12a80104e6549d509a233103d55",
+  "run_version_confirmed_by": "cozyblaze",
+  "note": "The published source is the version used during the run. The publication snapshot was collected on September 6, 2026 (San Francisco time, PDT / UTC-7) and includes the roll observation-only change, which was present in the local working tree but not yet committed there."
+}

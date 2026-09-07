@@ -1,0 +1,77 @@
+# Publication template: machine paths replaced; optional livestream overlay hooks disabled.
+model_reasoning_summary = "detailed"
+hide_agent_reasoning = false
+approval_policy = "never"
+default_permissions = "portal-run"
+web_search = "disabled"
+
+[windows]
+sandbox = "elevated"
+
+[tools]
+web_search = false
+
+[features]
+shell_tool = false
+unified_exec = false
+plugins = false
+apps = false
+browser_use = false
+computer_use = false
+image_generation = false
+multi_agent = false
+skill_search = false
+hooks = false
+
+[features.context_management]
+experimental_mode = true
+
+[apps._default]
+enabled = false
+
+# The browser/computer-use runtime is not part of this experiment.
+[mcp_servers.node_repl]
+command = "node" # Valid disabled placeholder even without a global node_repl entry.
+enabled = false
+
+# Trusted game broker. Its Node permission flags limit filesystem writes to
+# this run workspace and filesystem reads to the Portal plugin tree;
+# hardening.mjs restricts its network access to the local SPT endpoint.
+[mcp_servers.portal]
+command = "node"
+cwd = '__RUN_DIR__'
+args = [
+  '--permission',
+  '--allow-fs-read=__CONTROLLER_DIR__',
+  '--allow-fs-write=__RUN_DIR__',
+  '__CONTROLLER_DIR__\mcp\portal-mcp-server.mjs',
+]
+startup_timeout_sec = 60
+tool_timeout_sec = 180 # A maximum-length 6,600-tick plan takes about 99 seconds.
+enabled_tools = [
+  "portal_documentation",
+  "portal_screenshot",
+  "portal_exec",
+]
+default_tools_approval_mode = "approve"
+
+[mcp_servers.portal.env]
+PORTAL_SPT_HOST = "127.0.0.1"
+PORTAL_SPT_PORT = "27182"
+
+[permissions.portal-run]
+extends = ":workspace"
+description = "Write only inside the run workspace; deny host reads and command networking."
+
+[permissions.portal-run.filesystem]
+":root" = "deny"
+":minimal" = "read"
+":tmpdir" = "deny"
+":slash_tmp" = "deny"
+
+[permissions.portal-run.network]
+enabled = false
+
+[shell_environment_policy]
+inherit = "core"
+ignore_default_excludes = false

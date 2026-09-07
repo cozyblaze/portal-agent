@@ -1,0 +1,9 @@
+This directory contains modifications to SourcePauseTool.
+Upstream: https://github.com/OutOfBoundsOffice/SourcePauseTool
+Base commit: 3dfdd68314a9a47e2dc969706234814eacbf9cc7
+SourcePauseTool is distributed under the MIT License.
+The accompanying LICENSE preserves that upstream license and its bundled
+third-party notices, including the original public copyright contact details.
+The unified patch identifies every modified or added file and is not a copy
+of the complete upstream project. Upstream dependencies retain their own terms.
+Publication snapshot: 2026-09-07, including local uncommitted changes.

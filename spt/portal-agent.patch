@@ -1,0 +1,2436 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1543942..a31ca2e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -83,6 +83,7 @@ set(SPT_SOURCES
+ 	spt/features/overlay.cpp
+ 	spt/features/pause.cpp
+ 	spt/features/playerio.cpp
++	spt/features/portal_start_pause.cpp
+ 	spt/features/portalled_pause.cpp
+ 	spt/features/property_getter.cpp
+ 	spt/features/qccmd.cpp
+diff --git a/spt/features/afterframes.cpp b/spt/features/afterframes.cpp
+index 73b890f..e428a43 100644
+--- a/spt/features/afterframes.cpp
++++ b/spt/features/afterframes.cpp
+@@ -44,6 +44,11 @@ void AfterframesFeature::ResumeAfterframesQueue()
+ 	afterframesPaused = false;
+ }
+ 
++bool AfterframesFeature::HasAfterFramesEntries() const
++{
++	return !afterframesQueue.empty();
++}
++
+ bool AfterframesFeature::ShouldLoadFeature()
+ {
+ 	// Can't run commands without EngineConCmd
+diff --git a/spt/features/afterframes.hpp b/spt/features/afterframes.hpp
+index 27e9c99..44a9520 100644
+--- a/spt/features/afterframes.hpp
++++ b/spt/features/afterframes.hpp
+@@ -24,6 +24,7 @@ public:
+ 	void ResetAfterframesQueue();
+ 	void PauseAfterframesQueue();
+ 	void ResumeAfterframesQueue();
++	bool HasAfterFramesEntries() const;
+ 
+ protected:
+ 	virtual bool ShouldLoadFeature() override;
+diff --git a/spt/features/ipc-spt.cpp b/spt/features/ipc-spt.cpp
+index ac3189c..400b111 100644
+--- a/spt/features/ipc-spt.cpp
++++ b/spt/features/ipc-spt.cpp
+@@ -1,11 +1,25 @@
+ #include "stdafx.hpp"
++#include <cmath>
++#include <iomanip>
++#include <limits>
++#include <stdexcept>
++#include <vector>
+ #include "..\feature.hpp"
++#include "afterframes.hpp"
+ #include "convar.hpp"
+ #include "file.hpp"
+ #include "thirdparty\json_spt_include.hpp"
+ #include "ent_utils.hpp"
++#include "interfaces.hpp"
++#include "math.hpp"
++#include "pause.hpp"
++#include "playerio.hpp"
++#include "portal_start_pause.hpp"
+ #include "property_getter.hpp"
+ #include "signals.hpp"
++#include "tas.hpp"
++#include "tickrate.hpp"
++#include "..\scripts\framebulk_handler.hpp"
+ #include "..\scripts\srctas_reader.hpp"
+ #include "..\ipc\ipc.hpp"
+ #include "..\sptlib-wrapper.hpp"
+@@ -17,6 +31,172 @@ namespace ipc
+ 	void Loop();
+ 	void ShutdownIPC();
+ 	void Send(const nlohmann::json& msg);
++	bool IsActive();
++
++	struct PendingScreenshotRequest
++	{
++		bool hasId = false;
++		nlohmann::json id;
++		int framesUntilCapture = 1;
++	};
++
++	static std::vector<PendingScreenshotRequest> pendingScreenshots;
++	static constexpr std::size_t SCREENSHOT_CHUNK_CHARS = 16 * 1024;
++	// Covers backbuffers up to ~6K. Must stay well below the IPC outgoing
++	// buffer cap (base64 inflates this by 4/3) so a single screenshot can
++	// never trigger the slow-client disconnect.
++	static constexpr std::size_t MAX_SCREENSHOT_BYTES = 64 * 1024 * 1024;
++	static constexpr int MAX_PENDING_SCREENSHOTS = 4;
++
++	// TAS playback: the client submits a list of steps while the game is
++	// paused; SPT compiles them into native srctas framebulks, unpauses for
++	// that timeline, then re-pauses and reports back.
++
++	struct TasButton
++	{
++		const char* name;
++		const char* pressCmd;
++		const char* releaseCmd;
++	};
++
++	// Bit positions into TasStep::buttons; must stay in sync with TAS_BUTTONS.
++	enum TasButtonIndex
++	{
++		TAS_BUTTON_FORWARD = 0,
++		TAS_BUTTON_BACK,
++		TAS_BUTTON_LEFT,
++		TAS_BUTTON_RIGHT,
++		TAS_BUTTON_JUMP,
++		TAS_BUTTON_DUCK,
++		TAS_BUTTON_USE,
++		TAS_BUTTON_ATTACK,
++		TAS_BUTTON_ATTACK2,
++
++		TAS_BUTTON_COUNT_,
++	};
++
++	static constexpr TasButton TAS_BUTTONS[] = {
++	    {"forward", "+forward", "-forward"},
++	    {"back", "+back", "-back"},
++	    {"left", "+moveleft", "-moveleft"},
++	    {"right", "+moveright", "-moveright"},
++	    {"jump", "+jump", "-jump"},
++	    {"duck", "+duck", "-duck"},
++	    {"use", "+use", "-use"},
++	    {"attack", "+attack", "-attack"},
++	    {"attack2", "+attack2", "-attack2"},
++	};
++	static constexpr std::size_t TAS_BUTTON_COUNT = sizeof(TAS_BUTTONS) / sizeof(TAS_BUTTONS[0]);
++
++	static_assert(TAS_BUTTON_COUNT == TAS_BUTTON_COUNT_, "TAS_BUTTONS and TasButtonIndex out of sync");
++
++	struct TasStep
++	{
++		int ticks = 0;
++		unsigned buttons = 0; // bitmask over TAS_BUTTONS
++		bool hasPitchDelta = false;
++		bool hasYawDelta = false;
++		bool hasPitchAbs = false;
++		bool hasYawAbs = false;
++		float pitchDelta = 0.0f;
++		float yawDelta = 0.0f;
++		float pitchAbs = 0.0f;
++		float yawAbs = 0.0f;
++	};
++
++	struct TasPlayback
++	{
++		bool active = false;
++		bool agentRunBootstrap = false;
++		bool hasId = false;
++		bool includePosition = false;
++		bool directPauseUsed = false;
++		bool mouseEnableCaptured = false;
++		bool mouseInputSuppressed = false;
++		bool mouseInputRestored = false;
++		int mouseEnableBeforePlayback = 1;
++		nlohmann::json id;
++		long long ticksExecuted = 0;
++		long long requestedTicks = 0;
++		long long simulatedTicks = 0;
++		int acceptedHostTick = -1;
++		int firstSimulatedHostTick = -1;
++		int lastSimulatedHostTick = -1;
++		int pauseRequestHostTick = -1;
++		std::vector<TasStep> steps;
++		bool sourceInputStarted = false;
++	};
++
++	static TasPlayback tasPlayback;
++	static bool sourceTasSessionInitialized = false;
++
++	struct AgentRunLifecycle
++	{
++		bool active = false;
++		bool waitingForLoad = false;
++		bool readyTransitionPending = false;
++		bool initialPortalStartReached = false;
++		bool spawnSignonReceived = false;
++		bool fullSignonReceived = false;
++		bool bootstrapStarted = false;
++		bool bootstrapFailureReported = false;
++		int postSignonTicks = 0;
++	};
++
++	static AgentRunLifecycle agentRun;
++
++	// tas_run_done is assembled from the tick callback, but the player's
++	// observations are not final at that point: TickSignal fires before the
++	// engine simulates that tick, so anything read there describes the state
++	// one tick earlier than where playback actually stops. Measured with
++	// 1-tick forward runs: the response carried the pre-run origin while
++	// cl_showpos (and a follow-up observe) showed it 2.25u further along.
++	//
++	// So the response is stashed here with its observations still missing and
++	// completed from the IPC loop, which runs on the frame signal - after the
++	// tick has been simulated and the game re-paused. The message still leaves
++	// on the same flush it would have before, so this costs no extra latency.
++	struct PendingTasReport
++	{
++		bool pending = false;
++		// A level transition aborts the current plan before the destination map
++		// exists. Keep that result pending until the agent-run lifecycle has
++		// settled and TAS-paused the new map, so follow-up observations and the
++		// client's automatic screenshot describe the destination rather than the
++		// loading screen.
++		bool waitForAgentReady = false;
++		int readyRenderFramesLeft = 0;
++		bool includePosition = false;
++		nlohmann::json response;
++	};
++
++	static PendingTasReport pendingTasReport;
++
++	static constexpr std::size_t MAX_TAS_STEPS = 1000;
++	static constexpr long long MAX_TAS_TICKS = 6600; // ~100 seconds at Portal's 66.7 ticks/s
++	// The first client entity and even SIGNONSTATE_FULL arrive while the loading
++	// plaque is still being dismissed. Render frames are not sufficient here:
++	// Source can render repeatedly before it simulates a tick. Let a fixed number
++	// of real game ticks complete after full sign-on before TAS-pausing.
++	static constexpr int AGENT_RUN_POST_SIGNON_TICKS = 67;
++	// The loading plaque can survive the frame that establishes the final
++	// TAS-pause. Let the renderer present several paused gameplay frames before
++	// releasing tas_run_done and allowing the client to request its screenshot.
++	static constexpr int AGENT_RUN_POST_READY_RENDER_FRAMES = 4;
++	// Portal still suppresses player movement for the first few ticks after the
++	// bed camera hands control back. Consume those ticks neutrally so the first
++	// tick requested by the agent is an actual controllable gameplay tick.
++	static constexpr int AGENT_RUN_BOOTSTRAP_TICKS = 1;
++
++	void ReleaseAllTasButtons();
++	void StopTasPlayback(bool aborted, const char* reason);
++	void StartAgentRun();
++	void StopAgentRun();
++	void AdvanceAgentRunReadyState();
++	void FinishAgentRunReady();
++	void OnAgentRunSignonState(void* thisptr, int state);
++	void CompleteSourceTasPlayback();
++	void MarkSourceTasPlaybackStarted();
+ 
+ 	class IPCFeature : public FeatureWrapper<IPCFeature>
+ 	{
+@@ -42,6 +222,242 @@ namespace ipc
+ #endif
+ 	ConVar y_spt_ipc("y_spt_ipc", "0", 0, "Enables IPC.", IPC_Changed);
+ 	ConVar y_spt_ipc_port("y_spt_ipc_port", "27182", 0, "Port used for IPC.");
++	ConVar y_spt_ipc_expose_position("y_spt_ipc_expose_position",
++	                                 "0",
++	                                 0,
++	                                 "Allows IPC clients to read the player's world-space origin.");
++
++	float ClampFloat(float value, float minValue, float maxValue)
++	{
++		if (value < minValue)
++			return minValue;
++		if (value > maxValue)
++			return maxValue;
++		return value;
++	}
++
++	std::size_t MinSize(std::size_t lhs, std::size_t rhs)
++	{
++		return lhs < rhs ? lhs : rhs;
++	}
++
++	enum ViewAngleIndex
++	{
++		VIEW_PITCH = 0,
++		VIEW_YAW = 1,
++		VIEW_ROLL = 2,
++	};
++
++	void AddMessageId(const nlohmann::json& request, nlohmann::json& response)
++	{
++		auto id = request.find("id");
++		if (id != request.end())
++			response["id"] = *id;
++	}
++
++	void AddMessageId(const PendingScreenshotRequest& request, nlohmann::json& response)
++	{
++		if (request.hasId)
++			response["id"] = request.id;
++	}
++
++	nlohmann::json AnglesToJson(const float angles[3])
++	{
++		nlohmann::json json;
++		json["pitch"] = angles[VIEW_PITCH];
++		json["yaw"] = angles[VIEW_YAW];
++		json["roll"] = angles[VIEW_ROLL];
++		return json;
++	}
++
++	nlohmann::json FacingToJson(const float angles[3])
++	{
++		return AnglesToJson(angles);
++	}
++
++	nlohmann::json PositionToJson(const Vector& position)
++	{
++		nlohmann::json json;
++		json["x"] = position.x;
++		json["y"] = position.y;
++		json["z"] = position.z;
++		return json;
++	}
++
++	void AddUnavailableField(nlohmann::json& response, const char* field, const char* reason)
++	{
++		response["unavailable"][field] = reason;
++	}
++
++	bool TryGetPlayerPosition(Vector& position)
++	{
++		spt_playerio.GetPlayerFields();
++		if (!spt_playerio.m_vecAbsOrigin.Found())
++			return false;
++
++		position = spt_playerio.m_vecAbsOrigin.GetValue();
++		return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z);
++	}
++
++	void AddObservationFields(nlohmann::json& response, bool includeFacing, bool includePosition)
++	{
++		if (includeFacing)
++		{
++			if (EngineGetViewAngles)
++			{
++				float angles[3]{};
++				EngineGetViewAngles(angles);
++				response["facing"] = FacingToJson(angles);
++			}
++			else
++			{
++				AddUnavailableField(response, "facing", "view angle access is unavailable");
++			}
++		}
++
++		if (includePosition)
++		{
++			if (!y_spt_ipc_expose_position.GetBool())
++			{
++				AddUnavailableField(response, "position", "disabled");
++			}
++			else
++			{
++				Vector position;
++				if (TryGetPlayerPosition(position))
++					response["position"] = PositionToJson(position);
++				else
++					AddUnavailableField(response,
++					                    "position",
++					                    "player position access is unavailable");
++			}
++		}
++	}
++
++	void SendErrorResponse(const char* type, const nlohmann::json& request, const std::string& error)
++	{
++		nlohmann::json response;
++		response["type"] = type;
++		AddMessageId(request, response);
++		response["ok"] = false;
++		response["error"] = error;
++		Send(response);
++	}
++
++	void SendErrorResponse(const char* type, const PendingScreenshotRequest& request, const std::string& error)
++	{
++		nlohmann::json response;
++		response["type"] = type;
++		AddMessageId(request, response);
++		response["ok"] = false;
++		response["error"] = error;
++		Send(response);
++	}
++
++	bool ReadOptionalFloat(const nlohmann::json& msg, const char* field, float& out, std::string& error)
++	{
++		auto it = msg.find(field);
++		if (it == msg.end())
++			return true;
++
++		if (!it->is_number())
++		{
++			error = std::string(field) + " must be a number";
++			return false;
++		}
++
++		double value = it->get<double>();
++		if (!std::isfinite(value)
++		    || value < -(std::numeric_limits<float>::max)()
++		    || value > (std::numeric_limits<float>::max)())
++		{
++			error = std::string(field) + " is outside the supported range";
++			return false;
++		}
++
++		out = static_cast<float>(value);
++		return true;
++	}
++
++	bool ReadOptionalBool(const nlohmann::json& msg, const char* field, bool& out, std::string& error)
++	{
++		auto it = msg.find(field);
++		if (it == msg.end())
++			return true;
++
++		if (!it->is_boolean())
++		{
++			error = std::string(field) + " must be a boolean";
++			return false;
++		}
++
++		out = it->get<bool>();
++		return true;
++	}
++
++	bool ValidateNativeTasOptions(const nlohmann::json& msg, std::string& error)
++	{
++		auto it = msg.find("playback");
++		if (it != msg.end() && !it->is_string())
++		{
++			error = "playback must be a string";
++			return false;
++		}
++		if (it != msg.end() && it->get<std::string>() != "srctas")
++		{
++			error = "only \"srctas\" playback is supported";
++			return false;
++		}
++		if (msg.find("full_ticks") != msg.end())
++		{
++			error =
++			    "full_ticks is no longer supported; native playback always simulates every requested tick";
++			return false;
++		}
++
++		return true;
++	}
++
++	bool ReadOptionalFloatAlias(const nlohmann::json& msg,
++	                            const char* field,
++	                            const char* alias,
++	                            float& out,
++	                            std::string& error)
++	{
++		if (!ReadOptionalFloat(msg, field, out, error))
++			return false;
++
++		if (msg.find(field) == msg.end())
++			return ReadOptionalFloat(msg, alias, out, error);
++
++		return true;
++	}
++
++	std::string Base64Encode(const unsigned char* data, std::size_t size)
++	{
++		static constexpr char table[] =
++		    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++		std::string out;
++		out.reserve(((size + 2) / 3) * 4);
++
++		for (std::size_t i = 0; i < size; i += 3)
++		{
++			std::size_t remaining = size - i;
++			unsigned int triple = static_cast<unsigned int>(data[i]) << 16;
++			if (remaining > 1)
++				triple |= static_cast<unsigned int>(data[i + 1]) << 8;
++			if (remaining > 2)
++				triple |= static_cast<unsigned int>(data[i + 2]);
++
++			out.push_back(table[(triple >> 18) & 0x3F]);
++			out.push_back(table[(triple >> 12) & 0x3F]);
++			out.push_back(remaining > 1 ? table[(triple >> 6) & 0x3F] : '=');
++			out.push_back(remaining > 2 ? table[triple & 0x3F] : '=');
++		}
++
++		return out;
++	}
+ 
+ 	void StartIPC()
+ 	{
+@@ -54,6 +470,21 @@ namespace ipc
+ 
+ 	void ShutdownIPC()
+ 	{
++		pendingScreenshots.clear();
++		StopTasPlayback(true, "ipc shutting down");
++		if (sourceTasSessionInitialized)
++		{
++			if (EngineConCmd)
++				EngineConCmd("spt_tas_pause 0");
++			ReleaseAllTasButtons();
++			if (!SptSetPausedDirect(true) && EngineConCmd)
++				EngineConCmd("setpause");
++		}
++		sourceTasSessionInitialized = false;
++		// The connection is about to go away, so the report it just stashed
++		// can never be delivered; drop it instead of leaking it into whatever
++		// run comes after the next StartIPC.
++		pendingTasReport = PendingTasReport();
+ 		if (ipc::Winsock_Initialized())
+ 		{
+ 			server.CloseConnections();
+@@ -63,18 +494,1171 @@ namespace ipc
+ 
+ 	void CmdCallback(const nlohmann::json& msg)
+ 	{
++		// Raw Source commands are not exposed over IPC. High-level controls
++		// should use dedicated IPC message types instead.
+ 		nlohmann::json ackMsg;
+ 		ackMsg["type"] = "ack";
++		AddMessageId(msg, ackMsg);
++		ackMsg["ok"] = false;
++		ackMsg["error"] = "raw console commands are disabled over IPC";
+ 		ipc::Send(ackMsg);
++	}
++
++	void ObserveCallback(const nlohmann::json& msg)
++	{
++		auto fields = msg.find("fields");
++		if (fields == msg.end() || !fields->is_array() || fields->empty())
++		{
++			SendErrorResponse("observe", msg, "fields must be a non-empty array");
++			return;
++		}
++
++		bool includeFacing = false;
++		bool includePosition = false;
++		for (const auto& field : *fields)
++		{
++			if (!field.is_string())
++			{
++				SendErrorResponse("observe", msg, "every field must be a string");
++				return;
++			}
++
++			const std::string name = field.get<std::string>();
++			if (name == "facing")
++				includeFacing = true;
++			else if (name == "position")
++				includePosition = true;
++			else
++			{
++				SendErrorResponse("observe", msg, "unknown field: " + name);
++				return;
++			}
++		}
++
++		nlohmann::json response;
++		response["type"] = "observe";
++		AddMessageId(msg, response);
++		response["ok"] = true;
++		AddObservationFields(response, includeFacing, includePosition);
++		ipc::Send(response);
++	}
++
++	void LookDeltaCallback(const nlohmann::json& msg)
++	{
++		if (agentRun.active && agentRun.waitingForLoad)
++		{
++			SendErrorResponse("look_delta", msg, "start_run is still loading the player");
++			return;
++		}
++		if (tasPlayback.active)
++		{
++			SendErrorResponse("look_delta", msg, "cannot change view during tas_run");
++			return;
++		}
++		// Keep roll observation-only at the IPC boundary. MCP snippets can reach
++		// the SPT socket directly, so enforcing this only in the client API is not sufficient.
++		if (msg.find("roll") != msg.end() || msg.find("delta_roll") != msg.end())
++		{
++			SendErrorResponse("look_delta", msg, "roll is read-only");
++			return;
++		}
++		if (!EngineGetViewAngles || !EngineSetViewAngles)
++		{
++			SendErrorResponse("look_delta", msg, "view angle access is unavailable");
++			return;
++		}
++
++		float pitchDelta = 0.0f;
++		float yawDelta = 0.0f;
++		std::string error;
++		if (!ReadOptionalFloatAlias(msg, "pitch", "delta_pitch", pitchDelta, error)
++		    || !ReadOptionalFloatAlias(msg, "yaw", "delta_yaw", yawDelta, error))
++		{
++			SendErrorResponse("look_delta", msg, error);
++			return;
++		}
++
++		float oldAngles[3]{};
++		EngineGetViewAngles(oldAngles);
++
++		float newAngles[3] = {oldAngles[VIEW_PITCH], oldAngles[VIEW_YAW], oldAngles[VIEW_ROLL]};
++		newAngles[VIEW_PITCH] = ClampFloat(newAngles[VIEW_PITCH] + pitchDelta, -89.0f, 89.0f);
++		newAngles[VIEW_YAW] = static_cast<float>(utils::NormalizeDeg(newAngles[VIEW_YAW] + yawDelta));
++
++		EngineSetViewAngles(newAngles);
++
++		nlohmann::json response;
++		response["type"] = "look_delta";
++		AddMessageId(msg, response);
++		response["ok"] = true;
++		response["old_angles"] = AnglesToJson(oldAngles);
++		response["angles"] = AnglesToJson(newAngles);
++		response["facing"] = FacingToJson(newAngles);
++		ipc::Send(response);
++	}
++
++	bool ReadStepAngleField(const nlohmann::json& step,
++	                        const char* field,
++	                        bool& hasValue,
++	                        float& value,
++	                        std::string& error)
++	{
++		auto it = step.find(field);
++		if (it == step.end())
++			return true;
++
++		float parsed = 0.0f;
++		if (!ReadOptionalFloat(step, field, parsed, error))
++			return false;
++
++		hasValue = true;
++		value = parsed;
++		return true;
++	}
++
++	bool ParseTasStep(const nlohmann::json& json, std::size_t index, TasStep& step, std::string& error)
++	{
++		char prefix[48];
++		std::snprintf(prefix, sizeof(prefix), "steps[%u]", static_cast<unsigned>(index));
++
++		if (!json.is_object())
++		{
++			error = std::string(prefix) + " must be an object";
++			return false;
++		}
++
++		for (auto it = json.begin(); it != json.end(); ++it)
++		{
++			const std::string& key = it.key();
++			if (key != "ticks" && key != "keys" && key != "pitch" && key != "yaw"
++			    && key != "pitch_to" && key != "yaw_to")
++			{
++				error = std::string(prefix) + " has unknown field \"" + key + "\"";
++				return false;
++			}
++		}
++
++		auto ticks = json.find("ticks");
++		if (ticks == json.end() || !ticks->is_number_integer())
++		{
++			error = std::string(prefix) + ".ticks must be a positive integer";
++			return false;
++		}
++
++		long long tickCount = ticks->get<long long>();
++		if (tickCount <= 0 || tickCount > MAX_TAS_TICKS)
++		{
++			error = std::string(prefix) + ".ticks must be between 1 and "
++			        + std::to_string(MAX_TAS_TICKS);
++			return false;
++		}
++		step.ticks = static_cast<int>(tickCount);
++
++		auto keys = json.find("keys");
++		if (keys != json.end())
++		{
++			if (!keys->is_object())
++			{
++				error = std::string(prefix) + ".keys must be an object";
++				return false;
++			}
++
++			for (auto it = keys->begin(); it != keys->end(); ++it)
++			{
++				if (!it.value().is_boolean())
++				{
++					error = std::string(prefix) + ".keys." + it.key()
++					        + " must be a boolean";
++					return false;
++				}
++
++				bool matched = false;
++				for (std::size_t b = 0; b < TAS_BUTTON_COUNT; ++b)
++				{
++					if (it.key() == TAS_BUTTONS[b].name)
++					{
++						if (it.value().get<bool>())
++							step.buttons |= 1u << b;
++						matched = true;
++						break;
++					}
++				}
++
++				if (!matched)
++				{
++					error = std::string(prefix) + ".keys has unknown key \""
++					        + it.key() + "\"";
++					return false;
++				}
++			}
++		}
++
++		if (!ReadStepAngleField(json, "pitch", step.hasPitchDelta, step.pitchDelta, error)
++		    || !ReadStepAngleField(json, "yaw", step.hasYawDelta, step.yawDelta, error)
++		    || !ReadStepAngleField(json, "pitch_to", step.hasPitchAbs, step.pitchAbs, error)
++		    || !ReadStepAngleField(json, "yaw_to", step.hasYawAbs, step.yawAbs, error))
++		{
++			error = std::string(prefix) + ": " + error;
++			return false;
++		}
++
++		if ((step.hasPitchDelta && step.hasPitchAbs) || (step.hasYawDelta && step.hasYawAbs))
++		{
++			error = std::string(prefix) + " mixes relative and absolute angles for the same axis";
++			return false;
++		}
++
++		return true;
++	}
++
++	bool ParseTasSteps(const nlohmann::json& msg, std::vector<TasStep>& steps, std::string& error)
++	{
++		auto stepsIt = msg.find("steps");
++		if (stepsIt == msg.end() || !stepsIt->is_array() || stepsIt->empty())
++		{
++			error = "steps must be a non-empty array";
++			return false;
++		}
++
++		if (stepsIt->size() > MAX_TAS_STEPS)
++		{
++			error = "too many steps (max " + std::to_string(MAX_TAS_STEPS) + ")";
++			return false;
++		}
++
++		long long totalTicks = 0;
++		steps.reserve(stepsIt->size());
++		for (std::size_t i = 0; i < stepsIt->size(); ++i)
++		{
++			TasStep step;
++			if (!ParseTasStep((*stepsIt)[i], i, step, error))
++				return false;
++
++			totalTicks += step.ticks;
++			if (totalTicks > MAX_TAS_TICKS)
++			{
++				error = "total ticks exceed the limit of " + std::to_string(MAX_TAS_TICKS);
++				return false;
++			}
++
++			steps.push_back(step);
++		}
++
++		return true;
++	}
++
++	std::string SourceTasFloat(float value)
++	{
++		std::ostringstream stream;
++		stream << std::setprecision(std::numeric_limits<float>::max_digits10) << value;
++		return stream.str();
++	}
++
++	std::string BuildSourceTasFramebulk(const TasStep& step,
++	                                    float targetAngles[3],
++	                                    const char* consoleCommand = "")
++	{
++		std::string movement = "------";
++		if (step.buttons & (1u << TAS_BUTTON_FORWARD))
++			movement[0] = 'f';
++		if (step.buttons & (1u << TAS_BUTTON_LEFT))
++			movement[1] = 'l';
++		if (step.buttons & (1u << TAS_BUTTON_RIGHT))
++			movement[2] = 'r';
++		if (step.buttons & (1u << TAS_BUTTON_BACK))
++			movement[3] = 'b';
++
++		std::string other = "--------";
++		if (step.buttons & (1u << TAS_BUTTON_JUMP))
++			other[0] = 'j';
++		if (step.buttons & (1u << TAS_BUTTON_DUCK))
++			other[1] = 'd';
++		if (step.buttons & (1u << TAS_BUTTON_USE))
++			other[2] = 'u';
++		if (step.buttons & (1u << TAS_BUTTON_ATTACK))
++			other[3] = '1';
++		if (step.buttons & (1u << TAS_BUTTON_ATTACK2))
++			other[4] = '2';
++
++		std::string yaw = "-";
++		std::string pitch = "-";
++		if (step.hasYawAbs || step.hasYawDelta)
++		{
++			const float value = step.hasYawAbs ? step.yawAbs : targetAngles[VIEW_YAW] + step.yawDelta;
++			targetAngles[VIEW_YAW] = static_cast<float>(utils::NormalizeDeg(value));
++			yaw = SourceTasFloat(targetAngles[VIEW_YAW]);
++		}
++		if (step.hasPitchAbs || step.hasPitchDelta)
++		{
++			const float value =
++			    step.hasPitchAbs ? step.pitchAbs : targetAngles[VIEW_PITCH] + step.pitchDelta;
++			targetAngles[VIEW_PITCH] = ClampFloat(value, -89.0f, 89.0f);
++			pitch = SourceTasFloat(targetAngles[VIEW_PITCH]);
++		}
++
++		std::ostringstream line;
++		line << "----------|" << movement << '|' << other << '|' << yaw << '|' << pitch << '|' << step.ticks
++		     << '|' << consoleCommand;
++		return line.str();
++	}
++
++	scripts::FrameBulkOutput CompileSourceTasFramebulk(const std::string& line)
++	{
++		std::istringstream input(line);
++		scripts::FrameBulkInfo info(input);
++		return scripts::HandleFrameBulk(info);
++	}
++
++	void CaptureTasMouseState()
++	{
++		if (tasPlayback.mouseEnableCaptured || !g_pCVar)
++			return;
++
++		ConVar* mouseEnable = g_pCVar->FindVar("cl_mouseenable");
++		if (!mouseEnable)
++			return;
++
++		tasPlayback.mouseEnableBeforePlayback = mouseEnable->GetInt();
++		tasPlayback.mouseEnableCaptured = true;
++	}
++
++	void DisableTasMouse()
++	{
++		CaptureTasMouseState();
++		if (!tasPlayback.mouseEnableCaptured || !g_pCVar)
++			return;
++
++		ConVar* mouseEnable = g_pCVar->FindVar("cl_mouseenable");
++		if (!mouseEnable)
++			return;
++
++		mouseEnable->SetValue(0);
++		tasPlayback.mouseInputSuppressed = !mouseEnable->GetBool();
++	}
++
++	void RestoreTasMouse()
++	{
++		if (!tasPlayback.mouseEnableCaptured)
++			return;
++
++		if (g_pCVar)
++		{
++			ConVar* mouseEnable = g_pCVar->FindVar("cl_mouseenable");
++			if (mouseEnable)
++			{
++				mouseEnable->SetValue(tasPlayback.mouseEnableBeforePlayback);
++				tasPlayback.mouseInputRestored =
++				    mouseEnable->GetInt() == tasPlayback.mouseEnableBeforePlayback;
++			}
++		}
++
++		tasPlayback.mouseEnableCaptured = false;
++	}
++
++	bool QueueSourceTasPlayback(const std::vector<TasStep>& steps, std::string& error)
++	{
++		if (spt_afterframes.HasAfterFramesEntries())
++		{
++			error = "the native afterframes queue is busy";
++			return false;
++		}
++
++		try
++		{
++			const bool initializeSession = !sourceTasSessionInitialized;
++			if (initializeSession)
++				scripts::g_TASReader.ResetConvars();
++			SptPrepareForUnpause();
++			CaptureTasMouseState();
++
++			float targetAngles[3]{};
++			EngineGetViewAngles(targetAngles);
++			std::vector<scripts::FrameBulkOutput> outputs;
++			outputs.reserve(steps.size());
++			for (const TasStep& step : steps)
++			{
++				std::string line = BuildSourceTasFramebulk(step, targetAngles);
++				outputs.push_back(CompileSourceTasFramebulk(line));
++			}
++
++			const float tickTime = spt_tickrate.GetTickrate();
++			ConVar* fpsMax = g_pCVar ? g_pCVar->FindVar("fps_max") : nullptr;
++			if (!fpsMax)
++				throw std::runtime_error("fps_max is unavailable");
++			// fps_max is FCVAR_NOT_CONNECTED, so a normal console assignment is
++			// rejected once a map is active. Set it directly, as spt_cvar does,
++			// to keep host_framerate at one game tick per rendered frame without
++			// making the game run faster than real time after the segment.
++			fpsMax->SetValue(1.0f / tickTime);
++
++			// Keep the engine's TAS/usercmd phase alive between agent plans while
++			// freezing simulation time. A normal engine setpause/unpause boundary
++			// makes a segmented plan diverge from the same continuous srctas
++			// timeline; tas_pause holds host_frametime at zero instead.
++			//
++			// Compile completion as a real neutral framebulk. Besides running the
++			// marker, this emits the same -forward/-jump/etc. transitions as an
++			// ordinary srctas boundary, so an action cannot remain held while the
++			// agent is thinking or leak into the next plan.
++			TasStep terminalStep;
++			terminalStep.ticks = 0;
++			scripts::FrameBulkOutput terminalOutput = CompileSourceTasFramebulk(
++			    BuildSourceTasFramebulk(terminalStep,
++			                            targetAngles,
++			                            "spt_tas_pause 1;spt_ipc_tas_complete"));
++
++			// Use ParsedScript::AddFrameBulk and the global afterframes queue just
++			// like SourceTASReader::Execute. This keeps input transitions on the
++			// exact scheduler used by ordinary .srctas playback.
++			scripts::ParsedScript timeline;
++			timeline.Reset();
++			for (auto& output : outputs)
++				timeline.AddFrameBulk(output);
++			timeline.AddFrameBulk(terminalOutput);
++
++			tasPlayback.sourceInputStarted = false;
++
++			// Freeze before arming the queue so the first segment and every later
++			// segment begin in the same phase. Without this, the very first plan can
++			// inherit a running frame while plans after it begin under tas_pause.
++			tas_pause.SetValue(1);
++
++			for (auto entry : timeline.afterFramesEntries)
++			{
++				// afterframes decrements before testing for zero, so offsets 0 and 1
++				// both execute on the first queue pass. Normal srctas startup absorbs
++				// that phase in its save/load bootstrap; an agent segment starts in an
++				// already-loaded, tas-paused map. The pass that clears tas_pause also
++				// has zero host_frametime, so the first simulation happens on the next
++				// pass. Keep tick-zero input at zero and shift later boundaries by two
++				// frames so a length-N bulk actually simulates N ticks.
++				if (entry.framesLeft > 0)
++					entry.framesLeft += 2;
++				spt_afterframes.AddAfterFramesEntry(std::move(entry));
++			}
++			// Append this zero-frame entry after the first framebulk's zero-frame
++			// entries. OnFrame therefore applies the input while frozen, then
++			// resumes simulation in the same native scheduling pass.
++			spt_afterframes.AddAfterFramesEntry(
++			    afterframes_entry_t(0, "spt_tas_pause 0;unpause;spt_ipc_tas_started"));
++			spt_afterframes.ResumeAfterframesQueue();
++
++			std::string startCommand;
++			if (initializeSession)
++			{
++				std::ostringstream initialize;
++				initialize << ";spt_pause 0;spt_resetpitchyaw;tas_aim_reset;host_framerate "
++				           << std::setprecision(std::numeric_limits<float>::max_digits10) << tickTime;
++				startCommand = initialize.str();
++			}
++			if (tasPlayback.mouseEnableCaptured)
++				startCommand += ";cl_mouseenable 0";
++			if (tasPlayback.agentRunBootstrap)
++				startCommand += ";hideconsole";
++			DisableTasMouse();
++			EngineConCmd(startCommand.c_str());
++
++			sourceTasSessionInitialized = true;
++			return true;
++		}
++		catch (const std::exception& ex)
++		{
++			RestoreTasMouse();
++			error = std::string("failed to compile native TAS framebulks: ") + ex.what();
++			return false;
++		}
++	}
++
++	int GetHostTick()
++	{
++		return interfaces::engine_tool ? interfaces::engine_tool->HostTick() : -1;
++	}
++
++	void ApplyTasButtonsViaConsole(unsigned buttons)
++	{
++		for (std::size_t b = 0; b < TAS_BUTTON_COUNT; ++b)
++		{
++			if (buttons & (1u << b))
++				EngineConCmd(TAS_BUTTONS[b].pressCmd);
++			else
++				EngineConCmd(TAS_BUTTONS[b].releaseCmd);
++		}
++	}
++
++	void ReleaseAllTasButtons()
++	{
++		if (EngineConCmd)
++			ApplyTasButtonsViaConsole(0);
++	}
++
++	void QueueTasRunDone(bool aborted, const char* reason)
++	{
++		nlohmann::json response;
++		response["type"] = "tas_run_done";
++		if (tasPlayback.hasId)
++			response["id"] = tasPlayback.id;
++		response["ok"] = true;
++		response["aborted"] = aborted;
++		if (reason)
++			response["reason"] = reason;
++		response["ticks"] = tasPlayback.ticksExecuted;
++		response["requested_ticks"] = tasPlayback.requestedTicks;
++		response["playback_mode"] = "srctas";
++		response["input_mode"] = "srctas";
++		response["simulated_ticks"] = tasPlayback.simulatedTicks;
++		response["accepted_host_tick"] = tasPlayback.acceptedHostTick;
++		response["first_simulated_host_tick"] = tasPlayback.firstSimulatedHostTick;
++		response["last_simulated_host_tick"] = tasPlayback.lastSimulatedHostTick;
++		response["pause_request_host_tick"] = tasPlayback.pauseRequestHostTick;
++		response["direct_pause"] = tasPlayback.directPauseUsed;
++		response["mouse_input_suppressed"] = tasPlayback.mouseInputSuppressed;
++		response["mouse_input_restored"] = tasPlayback.mouseInputRestored;
++		if (tasPlayback.mouseInputSuppressed)
++			response["mouse_enable_before_playback"] = tasPlayback.mouseEnableBeforePlayback;
++
++		// Observations (and the raw angles) are filled in by
++		// FlushPendingTasReport once the final tick has actually simulated.
++		pendingTasReport = PendingTasReport();
++		pendingTasReport.pending = true;
++		pendingTasReport.includePosition = tasPlayback.includePosition;
++		pendingTasReport.response = std::move(response);
++	}
++
++	void FlushPendingTasReport()
++	{
++		if (!pendingTasReport.pending || pendingTasReport.waitForAgentReady)
++			return;
++		if (pendingTasReport.readyRenderFramesLeft > 0)
++		{
++			--pendingTasReport.readyRenderFramesLeft;
++			return;
++		}
++
++		nlohmann::json response = std::move(pendingTasReport.response);
++		const bool includePosition = pendingTasReport.includePosition;
++		pendingTasReport = PendingTasReport();
++
++		AddObservationFields(response, true, includePosition);
++
++		if (EngineGetViewAngles)
++		{
++			float angles[3]{};
++			EngineGetViewAngles(angles);
++			response["angles"] = AnglesToJson(angles);
++		}
++
++		ipc::Send(response);
++	}
++
++	void StopTasPlayback(bool aborted, const char* reason)
++	{
++		if (!tasPlayback.active)
++			return;
++		const bool agentRunBootstrap = tasPlayback.agentRunBootstrap;
++
++		spt_afterframes.ResetAfterframesQueue();
++		ReleaseAllTasButtons();
++		if (EngineConCmd)
++			EngineConCmd("spt_tas_pause 0");
++		tasPlayback.ticksExecuted = tasPlayback.simulatedTicks;
++		tasPlayback.pauseRequestHostTick = GetHostTick();
++		tasPlayback.directPauseUsed = SptSetPausedDirect(true);
++		if (!tasPlayback.directPauseUsed && EngineConCmd)
++			EngineConCmd("setpause");
++		RestoreTasMouse();
++		if (!agentRunBootstrap)
++			QueueTasRunDone(aborted, reason);
++		tasPlayback = TasPlayback();
++		sourceTasSessionInitialized = false;
++		if (agentRunBootstrap && agentRun.active && agentRun.waitingForLoad)
++			agentRun.bootstrapStarted = false;
++	}
++
++	void FinishAgentRunReady()
++	{
++		if (!agentRun.active || !agentRun.waitingForLoad)
++			return;
++
++		SptDisarmPortalStartPause();
++		agentRun.waitingForLoad = false;
++		agentRun.readyTransitionPending = false;
++		agentRun.initialPortalStartReached = true;
++		agentRun.bootstrapStarted = false;
++		if (g_pCVar)
++		{
++			if (ConVar* fpsMax = g_pCVar->FindVar("fps_max"))
++				fpsMax->SetValue(1.0f / spt_tickrate.GetTickrate());
++			if (ConVar* mouseEnable = g_pCVar->FindVar("cl_mouseenable"))
++				mouseEnable->SetValue(0);
++		}
++		tas_pause.SetValue(1);
++		if (pendingTasReport.pending && pendingTasReport.waitForAgentReady)
++		{
++			pendingTasReport.waitForAgentReady = false;
++			pendingTasReport.readyRenderFramesLeft = AGENT_RUN_POST_READY_RENDER_FRAMES;
++		}
++		Msg("Agent run ready: demo recording is active and simulation is TAS-paused.\n");
++	}
++
++	void CompleteSourceTasPlayback()
++	{
++		if (!tasPlayback.active)
++			return;
++
++		// The terminal zero-tick framebulk enables tas_pause before this marker.
++		// The requested native timeline has simulated completely, while the
++		// engine remains in phase for the next agent segment.
++		const bool agentRunBootstrap = tasPlayback.agentRunBootstrap;
++		const bool exactTicks = tasPlayback.simulatedTicks == tasPlayback.requestedTicks;
++		tasPlayback.ticksExecuted = tasPlayback.simulatedTicks;
++		tasPlayback.pauseRequestHostTick = GetHostTick();
++		RestoreTasMouse();
++		if (agentRunBootstrap)
++		{
++			tasPlayback = TasPlayback();
++			if (exactTicks)
++				FinishAgentRunReady();
++			else
++			{
++				sourceTasSessionInitialized = false;
++				agentRun.bootstrapStarted = false;
++				// The first native boundary can be consumed by the direct pause that
++				// spt_pause_on_portal_start just applied. Retrying from tas_pause is the
++				// normal phase-alignment path and is intentionally silent.
++			}
++			return;
++		}
++
++		if (exactTicks)
++			QueueTasRunDone(false, nullptr);
++		else
++			QueueTasRunDone(true, "native TAS timeline simulated the wrong number of ticks");
++		tasPlayback = TasPlayback();
++	}
++
++	void MarkSourceTasPlaybackStarted()
++	{
++		if (tasPlayback.active)
++			tasPlayback.sourceInputStarted = true;
++	}
++
++	void OnTasLevelInit(const char*)
++	{
++		sourceTasSessionInitialized = false;
++		if (agentRun.active)
++		{
++			agentRun.waitingForLoad = true;
++			agentRun.readyTransitionPending = false;
++			agentRun.spawnSignonReceived = false;
++			agentRun.fullSignonReceived = false;
++			agentRun.bootstrapStarted = false;
++			agentRun.bootstrapFailureReported = false;
++			agentRun.postSignonTicks = 0;
++		}
++	}
++
++	void OnTasLevelShutdown()
++	{
++		if (tasPlayback.active)
++		{
++			const bool waitForAgentReady = agentRun.active && !tasPlayback.agentRunBootstrap;
++			StopTasPlayback(true, "level shutdown");
++			if (waitForAgentReady && pendingTasReport.pending)
++				pendingTasReport.waitForAgentReady = true;
++		}
++		sourceTasSessionInitialized = false;
++	}
++
++	void OnTasFinishRestore(void*)
++	{
++		sourceTasSessionInitialized = false;
++		if (agentRun.active && agentRun.waitingForLoad)
++			agentRun.readyTransitionPending = true;
++	}
++
++	void TasRunCallback(const nlohmann::json& msg)
++	{
++		if (agentRun.active && agentRun.waitingForLoad)
++		{
++			SendErrorResponse("tas_run", msg, "start_run is still loading the player");
++			return;
++		}
++		if (tasPlayback.active)
++		{
++			SendErrorResponse("tas_run", msg, "a tas_run is already active");
++			return;
++		}
++		if (!EngineConCmd || !EngineGetViewAngles || !EngineSetViewAngles)
++		{
++			SendErrorResponse("tas_run", msg, "engine access is unavailable");
++			return;
++		}
++
++		if (!TickSignal.Works)
++		{
++			SendErrorResponse("tas_run", msg, "tick callback is unavailable");
++			return;
++		}
++
++		std::vector<TasStep> steps;
++		std::string error;
++		if (!ParseTasSteps(msg, steps, error))
++		{
++			SendErrorResponse("tas_run", msg, error);
++			return;
++		}
++
++		bool includePosition = false;
++		if (!ReadOptionalBool(msg, "include_position", includePosition, error))
++		{
++			SendErrorResponse("tas_run", msg, error);
++			return;
++		}
++
++		if (!ValidateNativeTasOptions(msg, error))
++		{
++			SendErrorResponse("tas_run", msg, error);
++			return;
++		}
++
++		if (!AfterFramesSignal.Works)
++		{
++			SendErrorResponse("tas_run", msg, "native TAS scheduling is unavailable");
++			return;
++		}
++
++		long long totalTicks = 0;
++		for (const TasStep& step : steps)
++			totalTicks += step.ticks;
++
++		tasPlayback = TasPlayback();
++		tasPlayback.active = true;
++		tasPlayback.includePosition = includePosition;
++		tasPlayback.steps = std::move(steps);
++		tasPlayback.requestedTicks = totalTicks;
++		tasPlayback.acceptedHostTick = GetHostTick();
++		auto id = msg.find("id");
++		if (id != msg.end())
++		{
++			tasPlayback.hasId = true;
++			tasPlayback.id = *id;
++		}
++
++		if (!QueueSourceTasPlayback(tasPlayback.steps, error))
++		{
++			tasPlayback = TasPlayback();
++			SendErrorResponse("tas_run", msg, error);
++			return;
++		}
++
++		nlohmann::json response;
++		response["type"] = "tas_run";
++		AddMessageId(msg, response);
++		response["ok"] = true;
++		response["steps"] = tasPlayback.steps.size();
++		response["ticks"] = totalTicks;
++		response["playback_mode"] = "srctas";
++		response["input_mode"] = "srctas";
++		response["direct_pause_available"] = SptCanSetPausedDirect();
++		response["mouse_input_suppressed"] = tasPlayback.mouseInputSuppressed;
++		if (tasPlayback.mouseInputSuppressed)
++			response["mouse_enable_before_playback"] = tasPlayback.mouseEnableBeforePlayback;
++		response["accepted_host_tick"] = tasPlayback.acceptedHostTick;
++		ipc::Send(response);
++	}
++
++	void TasAbortCallback(const nlohmann::json& msg)
++	{
++		nlohmann::json response;
++		response["type"] = "tas_abort";
++		AddMessageId(msg, response);
++
++		if (!tasPlayback.active)
++		{
++			response["ok"] = false;
++			response["error"] = "no tas_run is active";
++			ipc::Send(response);
++			return;
++		}
++
++		response["ok"] = true;
++		ipc::Send(response);
++		StopTasPlayback(true, "aborted by client");
++	}
+ 
+-		if (msg.find("cmd") != msg.end())
++	void OnTasServerActivate(bool result)
++	{
++		if (result && agentRun.active && agentRun.waitingForLoad)
++			agentRun.readyTransitionPending = true;
++	}
++
++	void OnAgentRunSignonState(void*, int state)
++	{
++		if (!agentRun.active || !agentRun.waitingForLoad)
++			return;
++
++		// Starting demo recording itself emits SIGNONSTATE_FULL, including while
++		// the actual client is still loading. Only accept FULL after the real
++		// connection has first passed through SIGNONSTATE_SPAWN.
++		if (state == 5) // SIGNONSTATE_SPAWN
++		{
++			agentRun.spawnSignonReceived = true;
++			agentRun.fullSignonReceived = false;
++			agentRun.postSignonTicks = 0;
++		}
++		else if (state == 6 && agentRun.spawnSignonReceived
++		         && !agentRun.fullSignonReceived) // SIGNONSTATE_FULL
++		{
++			agentRun.fullSignonReceived = true;
++			agentRun.postSignonTicks = 0;
++			if (EngineConCmd)
++				EngineConCmd("hideconsole");
++		}
++	}
++
++	void AdvanceAgentRunReadyState()
++	{
++		if (!agentRun.active || !agentRun.waitingForLoad || !agentRun.readyTransitionPending)
++			return;
++
++		Vector position;
++		if (!utils::spt_clientEntList.GetPlayer() || !TryGetPlayerPosition(position))
++		{
++			agentRun.postSignonTicks = 0;
++			return;
++		}
++
++		if (!agentRun.initialPortalStartReached)
+ 		{
+-			std::string cmd = msg["cmd"];
+-			EngineConCmd(cmd.c_str());
++			// testchmb_a_00 begins with an extended camera sequence. Full sign-on and
++			// a player entity happen while "Loading..." is still visible, so wait for
++			// the dedicated Portal-start detector to observe the real bed handoff.
++			if (!SptPortalStartPauseHasFired())
++				return;
+ 		}
+ 		else
+ 		{
+-			Msg("Message contained no cmd field!\n");
++			// Later maps have no new-game camera handoff. For those, wait for the
++			// real SPAWN->FULL sequence and a short deterministic simulation settle.
++			if (SetSignonStateSignal.Works && !agentRun.fullSignonReceived)
++				return;
++			if (agentRun.postSignonTicks < AGENT_RUN_POST_SIGNON_TICKS)
++				return;
++		}
++		if (agentRun.bootstrapStarted || tasPlayback.active)
++			return;
++
++		// Bootstrap the same native SourceTAS/afterframes path used by every agent
++		// action. Besides establishing the correct TAS phase, these neutral ticks
++		// provide the boundary Portal needs to dismiss its loading UI and process the
++		// queued hideconsole command, and let player movement become active, before
++		// the agent receives control.
++		TasStep bootstrapStep;
++		bootstrapStep.ticks = AGENT_RUN_BOOTSTRAP_TICKS;
++		tasPlayback = TasPlayback();
++		tasPlayback.active = true;
++		tasPlayback.agentRunBootstrap = true;
++		tasPlayback.requestedTicks = AGENT_RUN_BOOTSTRAP_TICKS;
++		tasPlayback.acceptedHostTick = GetHostTick();
++		tasPlayback.steps.push_back(bootstrapStep);
++
++		std::string error;
++		if (!QueueSourceTasPlayback(tasPlayback.steps, error))
++		{
++			tasPlayback = TasPlayback();
++			if (!agentRun.bootstrapFailureReported)
++			{
++				Warning("Agent run TAS bootstrap is waiting: %s\n", error.c_str());
++				agentRun.bootstrapFailureReported = true;
++			}
++			return;
++		}
++		agentRun.bootstrapStarted = true;
++	}
++
++	void StartAgentRun()
++	{
++		if (!EngineConCmd || !g_pCVar)
++		{
++			Warning("start_run is unavailable: engine command access is missing.\n");
++			return;
++		}
++		if (!g_pCVar->FindCommand("speedrun_start") || !g_pCVar->FindCommand("speedrun_stop"))
++		{
++			Warning("start_run requires the speedrun_demorecord plugin.\n");
++			return;
++		}
++
++		if (tasPlayback.active)
++			StopTasPlayback(true, "run restarted by user");
++		if (pendingTasReport.pending)
++		{
++			pendingTasReport.waitForAgentReady = false;
++			pendingTasReport.readyRenderFramesLeft = 0;
++		}
++
++		ReleaseAllTasButtons();
++		sourceTasSessionInitialized = false;
++		tas_pause.SetValue(0);
++		y_spt_ipc.SetValue(1);
++		y_spt_ipc_expose_position.SetValue(1);
++
++		if (ConVar* sptPause = g_pCVar->FindVar("spt_pause"))
++			sptPause->SetValue(0);
++		if (ConVar* fpsMax = g_pCVar->FindVar("fps_max"))
++			fpsMax->SetValue(1.0f / spt_tickrate.GetTickrate());
++		if (ConVar* hostFramerate = g_pCVar->FindVar("host_framerate"))
++			hostFramerate->SetValue(0);
++		if (ConVar* mouseEnable = g_pCVar->FindVar("cl_mouseenable"))
++			mouseEnable->SetValue(0);
++		if (ConVar* noFocusSleep = g_pCVar->FindVar("engine_no_focus_sleep"))
++			noFocusSleep->SetValue(0);
++		if (ConVar* pausedImage = g_pCVar->FindVar("cl_showpausedimage"))
++			pausedImage->SetValue(0);
++		if (ConVar* pauseOnPortalStart = g_pCVar->FindVar("spt_pause_on_portal_start"))
++			pauseOnPortalStart->SetValue(1);
++		if (ConVar* speedrunMap = g_pCVar->FindVar("speedrun_map"))
++			speedrunMap->SetValue("testchmb_a_00");
++		if (ConVar* speedrunSave = g_pCVar->FindVar("speedrun_save"))
++			speedrunSave->SetValue("");
++		if (ConVar* speedrunDir = g_pCVar->FindVar("speedrun_dir"))
++			speedrunDir->SetValue("./agent_runs/");
++
++		agentRun = AgentRunLifecycle();
++		agentRun.active = true;
++		agentRun.waitingForLoad = true;
++		SptArmPortalStartPause();
++		EngineConCmd("speedrun_stop;unpause;speedrun_start");
++		Msg("Agent run starting: loading testchmb_a_00 and arming demo autorecord.\n");
++	}
++
++	void StopAgentRun()
++	{
++		SptDisarmPortalStartPause();
++		if (tasPlayback.active)
++			StopTasPlayback(true, "run stopped by user");
++		if (pendingTasReport.pending)
++		{
++			pendingTasReport.waitForAgentReady = false;
++			pendingTasReport.readyRenderFramesLeft = 0;
++		}
++
++		agentRun = AgentRunLifecycle();
++		ReleaseAllTasButtons();
++		sourceTasSessionInitialized = false;
++		tas_pause.SetValue(0);
++
++		if (g_pCVar)
++		{
++			if (ConVar* sptPause = g_pCVar->FindVar("spt_pause"))
++				sptPause->SetValue(0);
++			if (ConVar* hostFramerate = g_pCVar->FindVar("host_framerate"))
++				hostFramerate->SetValue(0);
++			if (ConVar* mouseEnable = g_pCVar->FindVar("cl_mouseenable"))
++				mouseEnable->SetValue(1);
++		}
++
++		if (EngineConCmd)
++			EngineConCmd("speedrun_stop");
++		if (!SptSetPausedDirect(true) && EngineConCmd)
++			EngineConCmd("setpause");
++		Msg("Agent run stopped: demo recording ended and mouse input was restored.\n");
++	}
++
++	void OnTick(bool simulating)
++	{
++		if (simulating && agentRun.active && agentRun.waitingForLoad
++		    && agentRun.readyTransitionPending
++		    && (!SetSignonStateSignal.Works || agentRun.fullSignonReceived))
++		{
++			Vector position;
++			if (utils::spt_clientEntList.GetPlayer() && TryGetPlayerPosition(position))
++				++agentRun.postSignonTicks;
++			else
++				agentRun.postSignonTicks = 0;
++		}
++
++		if (!tasPlayback.active)
++			return;
++
++		if (!tasPlayback.agentRunBootstrap && !ipc::IsActive())
++		{
++			// Client went away mid-run; stop feeding inputs and freeze the game.
++			StopTasPlayback(true, "client disconnected");
++			return;
++		}
++
++		if (!simulating)
++			return;
++		if (!tasPlayback.sourceInputStarted)
++			return;
++
++		// Count the server ticks simulated by the native TAS timeline.
++		int hostTick = GetHostTick();
++		if (tasPlayback.firstSimulatedHostTick < 0)
++			tasPlayback.firstSimulatedHostTick = hostTick;
++		tasPlayback.lastSimulatedHostTick = hostTick;
++		++tasPlayback.simulatedTicks;
++	}
++
++	bool IsSupportedScreenshotFormat(const nlohmann::json& msg, std::string& error)
++	{
++		auto format = msg.find("format");
++		if (format == msg.end())
++			return true;
++
++		if (!format->is_string())
++		{
++			error = "format must be a string";
++			return false;
++		}
++
++		if (format->get<std::string>() != "rgb8")
++		{
++			error = "only rgb8 screenshots are supported";
++			return false;
++		}
++
++		return true;
++	}
++
++	void ScreenshotCallback(const nlohmann::json& msg)
++	{
++		std::string error;
++		if (!IsSupportedScreenshotFormat(msg, error))
++		{
++			SendErrorResponse("screenshot", msg, error);
++			return;
++		}
++
++		if (!interfaces::materialSystem)
++		{
++			SendErrorResponse("screenshot", msg, "material system is unavailable");
++			return;
++		}
++
++		if (pendingScreenshots.size() >= static_cast<std::size_t>(MAX_PENDING_SCREENSHOTS))
++		{
++			SendErrorResponse("screenshot", msg, "too many pending screenshot requests");
++			return;
++		}
++
++		PendingScreenshotRequest request;
++		auto id = msg.find("id");
++		if (id != msg.end())
++		{
++			request.hasId = true;
++			request.id = *id;
++		}
++		pendingScreenshots.push_back(request);
++
++		nlohmann::json response;
++		response["type"] = "screenshot_ack";
++		AddMessageId(msg, response);
++		response["ok"] = true;
++		response["frames_until_capture"] = request.framesUntilCapture;
++		ipc::Send(response);
++	}
++
++	void CaptureAndSendScreenshot(const PendingScreenshotRequest& request)
++	{
++		if (!interfaces::materialSystem)
++		{
++			SendErrorResponse("screenshot", request, "material system is unavailable");
++			return;
++		}
++
++		int width = 0;
++		int height = 0;
++		interfaces::materialSystem->GetBackBufferDimensions(width, height);
++		if (width <= 0 || height <= 0)
++		{
++			SendErrorResponse("screenshot", request, "invalid backbuffer dimensions");
++			return;
++		}
++
++		constexpr std::size_t pixelSize = 3;
++		std::size_t sizeWidth = static_cast<std::size_t>(width);
++		std::size_t sizeHeight = static_cast<std::size_t>(height);
++		if (sizeWidth > (std::numeric_limits<std::size_t>::max)() / sizeHeight / pixelSize)
++		{
++			SendErrorResponse("screenshot", request, "screenshot dimensions overflow");
++			return;
++		}
++
++		std::size_t byteCount = sizeWidth * sizeHeight * pixelSize;
++		if (byteCount > MAX_SCREENSHOT_BYTES)
++		{
++			SendErrorResponse("screenshot", request, "screenshot is too large");
++			return;
++		}
++
++		std::vector<unsigned char> pixels(byteCount);
++		CMatRenderContextPtr renderContext(interfaces::materialSystem);
++		if (!renderContext)
++		{
++			SendErrorResponse("screenshot", request, "render context is unavailable");
++			return;
++		}
++		renderContext->ReadPixels(0, 0, width, height, pixels.data(), IMAGE_FORMAT_RGB888);
++
++		std::string encoded = Base64Encode(pixels.data(), pixels.size());
++		std::size_t chunks = (encoded.size() + SCREENSHOT_CHUNK_CHARS - 1) / SCREENSHOT_CHUNK_CHARS;
++
++		nlohmann::json begin;
++		begin["type"] = "screenshot_begin";
++		AddMessageId(request, begin);
++		begin["ok"] = true;
++		begin["width"] = width;
++		begin["height"] = height;
++		begin["format"] = "rgb8";
++		begin["encoding"] = "base64";
++		begin["origin"] = "top_left";
++		begin["stride"] = width * static_cast<int>(pixelSize);
++		begin["bytes"] = byteCount;
++		begin["encoded_bytes"] = encoded.size();
++		begin["chunk_size"] = SCREENSHOT_CHUNK_CHARS;
++		begin["chunks"] = chunks;
++		ipc::Send(begin);
++
++		for (std::size_t i = 0; i < chunks; ++i)
++		{
++			std::size_t offset = i * SCREENSHOT_CHUNK_CHARS;
++			std::size_t length = MinSize(SCREENSHOT_CHUNK_CHARS, encoded.size() - offset);
++			nlohmann::json chunk;
++			chunk["type"] = "screenshot_chunk";
++			AddMessageId(request, chunk);
++			chunk["index"] = i;
++			chunk["data"] = encoded.substr(offset, length);
++			ipc::Send(chunk);
++		}
++
++		nlohmann::json end;
++		end["type"] = "screenshot_end";
++		AddMessageId(request, end);
++		end["ok"] = true;
++		ipc::Send(end);
++	}
++
++	void ProcessPendingScreenshots()
++	{
++		if (!ipc::IsActive())
++		{
++			pendingScreenshots.clear();
++			return;
++		}
++
++		for (auto it = pendingScreenshots.begin(); it != pendingScreenshots.end();)
++		{
++			if (it->framesUntilCapture > 0)
++			{
++				--it->framesUntilCapture;
++				++it;
++				continue;
++			}
++
++			CaptureAndSendScreenshot(*it);
++			it = pendingScreenshots.erase(it);
+ 		}
+ 	}
+ 
+@@ -91,6 +1675,11 @@ namespace ipc
+ 			StartIPC();
+ 		}
+ 		server.AddCallback("cmd", CmdCallback, false);
++		server.AddCallback("observe", ObserveCallback, false);
++		server.AddCallback("look_delta", LookDeltaCallback, false);
++		server.AddCallback("tas_run", TasRunCallback, false);
++		server.AddCallback("tas_abort", TasAbortCallback, false);
++		server.AddCallback("screenshot", ScreenshotCallback, false);
+ 	}
+ 
+ 	bool IsActive()
+@@ -102,7 +1691,12 @@ namespace ipc
+ 	{
+ 		if (ipc::Winsock_Initialized())
+ 		{
++			AdvanceAgentRunReadyState();
++			// Before server.Loop() so the completed report is queued for this
++			// frame's flush rather than the next one.
++			FlushPendingTasReport();
+ 			server.Loop();
++			ProcessPendingScreenshots();
+ 		}
+ 	}
+ 
+@@ -199,6 +1793,28 @@ namespace ipc
+ 
+ } // namespace ipc
+ 
++CON_COMMAND(y_spt_ipc_tas_complete, "Internal marker for native IPC TAS segment completion.\n")
++{
++	ipc::CompleteSourceTasPlayback();
++}
++
++CON_COMMAND(y_spt_ipc_tas_started, "Internal marker for native IPC TAS segment start.\n")
++{
++	ipc::MarkSourceTasPlaybackStarted();
++}
++
++CON_COMMAND(y_spt_agent_start_run,
++            "Starts a Portal agent run from testchmb_a_00 with demo autorecord and TAS-ready pause.\n")
++{
++	ipc::StartAgentRun();
++}
++
++CON_COMMAND(y_spt_agent_stop_run,
++            "Stops the active Portal agent run, demo recording, and restores mouse input.\n")
++{
++	ipc::StopAgentRun();
++}
++
+ #if !defined(OE)
+ CON_COMMAND(y_spt_ipc_ent, "Outputs entity data to IPC client.\n")
+ {
+@@ -356,6 +1972,18 @@ void ipc::IPCFeature::LoadFeature()
+ 	{
+ 		Init();
+ 		FrameSignal.Connect(Loop);
++		if (TickSignal.Works)
++			TickSignal.Connect(ipc::OnTick);
++		if (LevelInitSignal.Works)
++			LevelInitSignal.Connect(ipc::OnTasLevelInit);
++		if (LevelShutdownSignal.Works)
++			LevelShutdownSignal.Connect(ipc::OnTasLevelShutdown);
++		if (SV_ActivateServerSignal.Works)
++			SV_ActivateServerSignal.Connect(ipc::OnTasServerActivate);
++		if (FinishRestoreSignal.Works)
++			FinishRestoreSignal.Connect(ipc::OnTasFinishRestore);
++		if (SetSignonStateSignal.Works)
++			SetSignonStateSignal.Connect(ipc::OnAgentRunSignonState);
+ #ifndef OE
+ 		InitCommand(y_spt_ipc_ent);
+ 		InitCommand(y_spt_ipc_properties);
+@@ -363,8 +1991,13 @@ void ipc::IPCFeature::LoadFeature()
+ 		InitCommand(y_spt_ipc_echo);
+ 		InitCommand(y_spt_ipc_playback);
+ 		InitCommand(y_spt_ipc_gamedir);
++		InitCommand(y_spt_ipc_tas_complete);
++		InitCommand(y_spt_ipc_tas_started);
++		InitCommand(y_spt_agent_start_run);
++		InitCommand(y_spt_agent_stop_run);
+ 
+ 		InitConcommandBase(y_spt_ipc);
+ 		InitConcommandBase(y_spt_ipc_port);
++		InitConcommandBase(y_spt_ipc_expose_position);
+ 	}
+ }
+diff --git a/spt/features/pause.cpp b/spt/features/pause.cpp
+index 4986820..a97047c 100644
+--- a/spt/features/pause.cpp
++++ b/spt/features/pause.cpp
+@@ -6,6 +6,7 @@
+ #include "visualizations\imgui\imgui_interface.hpp"
+ #include "tas.hpp"
+ #include "game_detection.hpp"
++#include "pause.hpp"
+ 
+ ConVar y_spt_pause("y_spt_pause", "0", FCVAR_ARCHIVE);
+ 
+@@ -13,6 +14,9 @@ ConVar y_spt_pause("y_spt_pause", "0", FCVAR_ARCHIVE);
+ class PauseFeature : public FeatureWrapper<PauseFeature>
+ {
+ public:
++	bool CanSetPausedDirect() const;
++	bool SetPausedDirect(bool paused);
++
+ protected:
+ 	virtual void InitHooks() override;
+ 	virtual void PreHook() override;
+@@ -22,6 +26,11 @@ private:
+ 	uintptr_t ORIG_SpawnPlayer = 0;
+ 	bool* pM_bLoadgame = nullptr;
+ 	void* pGameServer = nullptr;
++	// Fallback for SetPausedDirect on builds where the pGameServer pattern
++	// isn't found: the engine calls SetPaused on its global CGameServer
++	// singleton, so the last observed thisptr stays valid for the session.
++	// pGameServer is preferred when available.
++	void* pLastSetPausedThisptr = nullptr;
+ 
+ 	void SV_ActivateServer(bool result);
+ 	void FinishRestore(void* thisptr);
+@@ -30,6 +39,39 @@ private:
+ 
+ static PauseFeature spt_pause;
+ 
++bool PauseFeature::CanSetPausedDirect() const
++{
++	return spt_generic.ORIG_SetPaused && (pGameServer || pLastSetPausedThisptr);
++}
++
++bool PauseFeature::SetPausedDirect(bool paused)
++{
++	void* server = pGameServer ? pGameServer : pLastSetPausedThisptr;
++	if (!spt_generic.ORIG_SetPaused || !server)
++		return false;
++
++	if (!paused)
++		spt_generic.shouldPreventNextUnpause = false;
++
++	spt_generic.ORIG_SetPaused(server, 0, paused);
++	return true;
++}
++
++bool SptCanSetPausedDirect()
++{
++	return spt_pause.CanSetPausedDirect();
++}
++
++bool SptSetPausedDirect(bool paused)
++{
++	return spt_pause.SetPausedDirect(paused);
++}
++
++void SptPrepareForUnpause()
++{
++	spt_generic.shouldPreventNextUnpause = false;
++}
++
+ namespace patterns
+ {
+ 	PATTERNS(
+@@ -57,6 +99,7 @@ void PauseFeature::PreHook()
+ {
+ 	pM_bLoadgame = nullptr;
+ 	pGameServer = nullptr;
++	pLastSetPausedThisptr = nullptr;
+ 
+ 	if (ORIG_SpawnPlayer)
+ 	{
+@@ -188,6 +231,8 @@ void PauseFeature::FinishRestore(void* thisptr)
+ 
+ void PauseFeature::SetPaused(void* thisptr, bool paused)
+ {
++	pLastSetPausedThisptr = thisptr;
++
+ 	if (pM_bLoadgame)
+ 	{
+ 		DevMsg("Engine call: SetPaused( %s ); m_bLoadgame = %s\n",
+diff --git a/spt/features/pause.hpp b/spt/features/pause.hpp
+new file mode 100644
+index 0000000..810cc25
+--- /dev/null
++++ b/spt/features/pause.hpp
+@@ -0,0 +1,5 @@
++#pragma once
++
++bool SptCanSetPausedDirect();
++bool SptSetPausedDirect(bool paused);
++void SptPrepareForUnpause();
+diff --git a/spt/features/portal_start_pause.cpp b/spt/features/portal_start_pause.cpp
+new file mode 100644
+index 0000000..c626851
+--- /dev/null
++++ b/spt/features/portal_start_pause.cpp
+@@ -0,0 +1,221 @@
++#include "stdafx.hpp"
++#include "..\feature.hpp"
++#include "convar.hpp"
++#include "game_detection.hpp"
++#include "map_utils.hpp"
++#include "playerio.hpp"
++#include "portal_start_pause.hpp"
++#include "tas.hpp"
++#include "signals.hpp"
++#include "..\sptlib-wrapper.hpp"
++
++#include <cmath>
++#include <cstring>
++
++ConVar spt_pause_on_portal_start("spt_pause_on_portal_start",
++                                 "0",
++                                 FCVAR_ARCHIVE,
++                                 "Allows agent start_run to TAS-pause at Portal's new-game bed start.");
++ConVar spt_pause_on_portal_start_debug("spt_pause_on_portal_start_debug",
++                                       "0",
++                                       0,
++                                       "Prints debug info for spt_pause_on_portal_start.");
++
++class PortalStartPauseFeature : public FeatureWrapper<PortalStartPauseFeature>
++{
++public:
++	void Arm()
++	{
++		armed = true;
++	}
++
++	void Disarm()
++	{
++		armed = false;
++	}
++
++	bool HasFired() const
++	{
++		return fired;
++	}
++protected:
++	virtual bool ShouldLoadFeature() override;
++	virtual void LoadFeature() override;
++	virtual void UnloadFeature() override;
++
++private:
++	bool armed = false;
++	bool fired = false;
++	bool sawNonPlayerView = false;
++	bool previousPlayerView = true;
++	bool fetchedFields = false;
++	PlayerField<CBaseHandle> m_hViewEntity;
++
++	void LevelInit(char const* pMapName);
++	void LevelShutdown();
++	void Tick(bool simulating);
++	void ResetState();
++	void FetchFields();
++	bool IsPortalStartMap();
++	bool IsAtPortalStart();
++	bool IsUsingPlayerView();
++};
++
++static PortalStartPauseFeature spt_portal_start_pause;
++
++void SptArmPortalStartPause()
++{
++	spt_portal_start_pause.Arm();
++}
++
++void SptDisarmPortalStartPause()
++{
++	spt_portal_start_pause.Disarm();
++}
++
++bool SptPortalStartPauseHasFired()
++{
++	return spt_portal_start_pause.HasFired();
++}
++
++bool PortalStartPauseFeature::ShouldLoadFeature()
++{
++	return interfaces::engine_client != nullptr;
++}
++
++void PortalStartPauseFeature::LoadFeature()
++{
++	// Without the tick signal the feature can never fire; don't register
++	// convars that would silently do nothing.
++	if (!TickSignal.Works)
++		return;
++
++	InitConcommandBase(spt_pause_on_portal_start);
++	InitConcommandBase(spt_pause_on_portal_start_debug);
++
++	TickSignal.Connect(this, &PortalStartPauseFeature::Tick);
++
++	if (LevelInitSignal.Works)
++		LevelInitSignal.Connect(this, &PortalStartPauseFeature::LevelInit);
++
++	if (LevelShutdownSignal.Works)
++		LevelShutdownSignal.Connect(this, &PortalStartPauseFeature::LevelShutdown);
++}
++
++void PortalStartPauseFeature::UnloadFeature()
++{
++	Disarm();
++	ResetState();
++}
++
++void PortalStartPauseFeature::LevelInit(char const* pMapName)
++{
++	ResetState();
++
++	if (spt_pause_on_portal_start_debug.GetBool())
++		Msg("spt_pause_on_portal_start: level init %s\n", pMapName ? pMapName : "<null>");
++}
++
++void PortalStartPauseFeature::LevelShutdown()
++{
++	ResetState();
++}
++
++void PortalStartPauseFeature::Tick(bool simulating)
++{
++	if (!simulating || !armed || fired || !spt_pause_on_portal_start.GetBool())
++		return;
++
++	if (!utils::DoesGameLookLikePortal())
++		return;
++
++	if (!IsPortalStartMap())
++		return;
++
++	if (!spt_playerio.PlayerIOAddressesFound())
++		return;
++
++	FetchFields();
++
++	const bool atStart = IsAtPortalStart();
++	const bool playerView = IsUsingPlayerView();
++	const bool switchedToPlayerView = !previousPlayerView && playerView;
++
++	if (!playerView)
++		sawNonPlayerView = true;
++
++	if (spt_pause_on_portal_start_debug.GetBool() && playerView != previousPlayerView)
++	{
++		const Vector pos = spt_playerio.m_vecAbsOrigin.GetValue();
++		Msg("spt_pause_on_portal_start: player_view=%s pos=(%.3f %.3f %.3f) at_start=%s saw_camera=%s\n",
++		    playerView ? "true" : "false",
++		    pos.x,
++		    pos.y,
++		    pos.z,
++		    atStart ? "true" : "false",
++		    sawNonPlayerView ? "true" : "false");
++	}
++
++	previousPlayerView = playerView;
++
++	if (atStart && sawNonPlayerView && switchedToPlayerView)
++	{
++		tas_pause.SetValue(1);
++		armed = false;
++		fired = true;
++
++		if (spt_pause_on_portal_start_debug.GetBool())
++			Msg("spt_pause_on_portal_start: TAS-paused at Portal bed start.\n");
++	}
++}
++
++void PortalStartPauseFeature::ResetState()
++{
++	fired = false;
++	sawNonPlayerView = false;
++	previousPlayerView = true;
++	fetchedFields = false;
++	m_hViewEntity = PlayerField<CBaseHandle>();
++}
++
++void PortalStartPauseFeature::FetchFields()
++{
++	if (fetchedFields)
++		return;
++
++	m_hViewEntity = spt_entprops.GetPlayerField<CBaseHandle>("m_hViewEntity");
++	fetchedFields = true;
++
++	if (spt_pause_on_portal_start_debug.GetBool())
++		Msg("spt_pause_on_portal_start: m_hViewEntity %s.\n", m_hViewEntity.Found() ? "found" : "not found");
++}
++
++bool PortalStartPauseFeature::IsPortalStartMap()
++{
++	const char* map = utils::GetLoadedMap();
++	return map && std::strstr(map, "testchmb_a_00");
++}
++
++bool PortalStartPauseFeature::IsAtPortalStart()
++{
++	const Vector pos = spt_playerio.m_vecAbsOrigin.GetValue();
++
++	// Player origin at the testchmb_a_00 wake-up point (on the bed); the
++	// tolerance absorbs save/load and physics-settle jitter.
++	constexpr float targetX = -544.0f;
++	constexpr float targetY = -368.776f;
++	constexpr float targetZ = 160.0f;
++	constexpr float tolerance = 8.0f;
++
++	return std::fabs(pos.x - targetX) <= tolerance && std::fabs(pos.y - targetY) <= tolerance
++	       && std::fabs(pos.z - targetZ) <= tolerance;
++}
++
++bool PortalStartPauseFeature::IsUsingPlayerView()
++{
++	if (!m_hViewEntity.Found())
++		return true;
++
++	CBaseHandle viewEntity = m_hViewEntity.GetValue();
++	return !viewEntity.IsValid() || viewEntity.GetEntryIndex() == 1;
++}
+diff --git a/spt/features/portal_start_pause.hpp b/spt/features/portal_start_pause.hpp
+new file mode 100644
+index 0000000..1ed5c43
+--- /dev/null
++++ b/spt/features/portal_start_pause.hpp
+@@ -0,0 +1,10 @@
++#pragma once
++
++// Arms the one-shot Portal bed handoff used by agent start_run. The archived
++// cvar is only a master enable; regular New Game runs are never armed.
++void SptArmPortalStartPause();
++void SptDisarmPortalStartPause();
++
++// True after the armed detector has observed Portal's real new-game
++// camera-to-player handoff and TAS-paused on the bed.
++bool SptPortalStartPauseHasFired();
+diff --git a/spt/ipc/ipc.cpp b/spt/ipc/ipc.cpp
+index 2080d79..0406d41 100644
+--- a/spt/ipc/ipc.cpp
++++ b/spt/ipc/ipc.cpp
+@@ -14,7 +14,12 @@ static IpcPrintFunc PRINT_FUNC = nullptr;
+ static bool WINSOCK_INITIALIZED = false;
+ static u_long BLOCKING = 1;
+ const int BUFLEN = 32767;
++const int MAX_INCOMING_BUFFER = BUFLEN * 32;
+ const int MAX_MSG_BUFFER = 256;
++// Outgoing data waiting on a client that isn't reading the socket. Sized to
++// hold a couple of encoded screenshots; a client further behind than this
++// isn't draining the connection and gets dropped.
++const std::size_t MAX_OUTGOING_BUFFER = 96 * 1024 * 1024;
+ 
+ void CloseSocket(int& socket)
+ {
+@@ -41,6 +46,8 @@ ipc::IPCServer::IPCServer()
+ 	listenSocket = INVALID_SOCKET;
+ 	clientSocket = INVALID_SOCKET;
+ 	RECV_BUFFER = new char[BUFLEN];
++	outgoingOffset = 0;
++	outgoingQueuedBytes = 0;
+ }
+ 
+ void ipc::InitWinsock()
+@@ -124,7 +131,7 @@ void ipc::IPCServer::CloseConnections()
+ 	if (listenSocket != SOCKET_ERROR)
+ 		CloseSocket(listenSocket);
+ 	if (clientSocket != SOCKET_ERROR)
+-		CloseSocket(clientSocket);
++		CloseClientConnection();
+ }
+ 
+ void ipc::IPCServer::Loop()
+@@ -132,6 +139,7 @@ void ipc::IPCServer::Loop()
+ 	CheckForConnections();
+ 	ReadMessages();
+ 	DispatchMessages();
++	FlushOutgoingMessages();
+ }
+ 
+ bool ipc::IPCServer::BlockForMessages(const std::string& type, int timeoutMsec)
+@@ -179,20 +187,60 @@ void ipc::IPCServer::SendMsg(const nlohmann::json& msg)
+ 	}
+ 
+ 	std::string out = msg.dump();
+-	const char* string = out.c_str();
++	out.push_back('\0');
++	outgoingQueuedBytes += out.size();
++	outgoingQueue.push_back(std::move(out));
+ 
+-	for (std::size_t i = 0; i <= out.size();)
++	if (outgoingQueuedBytes > MAX_OUTGOING_BUFFER)
+ 	{
+-		int result = send(clientSocket, string, out.size() - i + 1, 0);
++		Print("Outgoing buffer full, client is not reading; closing socket.\n");
++		CloseClientConnection();
++		return;
++	}
++
++	FlushOutgoingMessages();
++}
++
++void ipc::IPCServer::CloseClientConnection()
++{
++	CloseSocket(clientSocket);
++	incomingBuffer.clear();
++	outgoingQueue.clear();
++	outgoingOffset = 0;
++	outgoingQueuedBytes = 0;
++}
++
++void ipc::IPCServer::FlushOutgoingMessages()
++{
++	if (clientSocket == SOCKET_ERROR)
++		return;
++
++	while (!outgoingQueue.empty())
++	{
++		std::string& out = outgoingQueue.front();
++		const char* data = out.data() + outgoingOffset;
++		int bytesLeft = static_cast<int>(out.size() - outgoingOffset);
++		int result = send(clientSocket, data, bytesLeft, 0);
+ 		if (result == SOCKET_ERROR)
+ 		{
+-			Print("Send failed: %d\n", WSAGetLastError());
+-			CloseSocket(clientSocket);
++			int error = WSAGetLastError();
++			if (error == WSAEWOULDBLOCK)
++				return;
++
++			Print("Send failed: %d\n", error);
++			CloseClientConnection();
+ 			return;
+ 		}
++		if (result == 0)
++			return;
+ 
+-		i += result;
+-		string += result;
++		outgoingOffset += result;
++		if (outgoingOffset < out.size())
++			return;
++
++		outgoingQueuedBytes -= out.size();
++		outgoingQueue.pop_front();
++		outgoingOffset = 0;
+ 	}
+ }
+ 
+@@ -213,20 +261,25 @@ void ipc::IPCServer::ReadMessages()
+ 		return;
+ 	}
+ 
+-	int offset = 0;
+ 	int result;
+ 
+ 	do
+ 	{
+-		result = recv(clientSocket, RECV_BUFFER + offset, BUFLEN - offset, 0);
++		result = recv(clientSocket, RECV_BUFFER, BUFLEN, 0);
+ 
+ 		if (result > 0)
+ 		{
+-			offset += result;
++			incomingBuffer.append(RECV_BUFFER, result);
++			if (incomingBuffer.size() > static_cast<std::size_t>(MAX_INCOMING_BUFFER))
++			{
++				Print("Incoming message too large, closing socket.\n");
++				CloseClientConnection();
++				return;
++			}
+ 		}
+ 		else if (result == 0)
+ 		{
+-			CloseSocket(clientSocket);
++			CloseClientConnection();
+ 			Print("Client disconnected, closing socket.\n");
+ 			return;
+ 		}
+@@ -236,65 +289,66 @@ void ipc::IPCServer::ReadMessages()
+ 
+ 			if (error != WSAEWOULDBLOCK && error != WSAECONNREFUSED)
+ 			{
+-				CloseSocket(clientSocket);
++				CloseClientConnection();
+ 				Print("Client disconnected, closing socket.\n");
+ 				return;
+ 			}
+ 		}
+ 
+-	} while (result > 0 && offset < BUFLEN);
++	} while (result > 0);
+ 
+-	int bytesRead = offset;
+-	int startIndex = 0;
++	std::size_t parseOffset = 0;
+ 
+-	for (int i = 0; i < bytesRead; ++i)
++	for (auto endIndex = incomingBuffer.find('\0', parseOffset);
++	     endIndex != std::string::npos;
++	     endIndex = incomingBuffer.find('\0', parseOffset))
+ 	{
+-		if (RECV_BUFFER[i] == '\0')
++		try
+ 		{
+-			char* str = RECV_BUFFER + startIndex;
+-			try
++			nlohmann::json msg = nlohmann::json::parse(incomingBuffer.data() + parseOffset,
++			                                           incomingBuffer.data() + endIndex);
++
++			if (msg.find("type") != msg.end())
+ 			{
+-				nlohmann::json msg = nlohmann::json::parse(str, RECV_BUFFER + i);
++				std::string type = msg["type"];
+ 
+-				if (msg.find("type") != msg.end())
++				if (callbacks.find(type) == callbacks.end())
++				{
++					Print("No callback for message type %s\n", type.c_str());
++				}
++				else
+ 				{
+-					std::string type = msg["type"];
++					if (msgQueue.find(type) == msgQueue.end())
++					{
++						msgQueue[type] = std::vector<nlohmann::json>();
++					}
+ 
+-					if (callbacks.find(type) == callbacks.end())
++					if (msgQueue[type].size() < MAX_MSG_BUFFER)
+ 					{
+-						Print("No callback for message type %s\n", type.c_str());
++						msgQueue[type].push_back(msg);
+ 					}
+ 					else
+ 					{
+-						if (msgQueue.find(type) == msgQueue.end())
+-						{
+-							msgQueue[type] = std::vector<nlohmann::json>();
+-						}
+-
+-						if (msgQueue[type].size() < MAX_MSG_BUFFER)
+-						{
+-							msgQueue[type].push_back(msg);
+-						}
+-						else
+-						{
+-							Print(
+-							    "Too many messages of type %s in queue, discarding message.\n",
+-							    type.c_str());
+-						}
++						Print(
++						    "Too many messages of type %s in queue, discarding message.\n",
++						    type.c_str());
+ 					}
+ 				}
+-				else
+-				{
+-					Print("Bad message received.\n");
+-				}
+ 			}
+-			catch (const std::exception& ex)
++			else
+ 			{
+-				Print("Error parsing message: %s\n", ex.what());
++				Print("Bad message received.\n");
+ 			}
+-			startIndex = i + 1;
+ 		}
++		catch (const std::exception& ex)
++		{
++			Print("Error parsing message: %s\n", ex.what());
++		}
++		parseOffset = endIndex + 1;
+ 	}
++
++	if (parseOffset > 0)
++		incomingBuffer.erase(0, parseOffset);
+ }
+ 
+ void ipc::IPCServer::CheckForConnections()
+diff --git a/spt/ipc/ipc.hpp b/spt/ipc/ipc.hpp
+index 7b99ad5..dbcaaf3 100644
+--- a/spt/ipc/ipc.hpp
++++ b/spt/ipc/ipc.hpp
+@@ -1,5 +1,7 @@
+ #include <unordered_map>
+ #include <vector>
++#include <deque>
++#include <string>
+ 
+ #include "thirdparty\json_spt_include.hpp"
+ 
+@@ -28,6 +30,8 @@ namespace ipc
+ 		~IPCServer();
+ 
+ 	private:
++		void CloseClientConnection();
++		void FlushOutgoingMessages();
+ 		void ReadMessages();
+ 		void CheckForConnections();
+ 		void DispatchMessages();
+@@ -35,6 +39,10 @@ namespace ipc
+ 		int listenSocket;
+ 		int clientSocket;
+ 		char* RECV_BUFFER;
++		std::string incomingBuffer;
++		std::deque<std::string> outgoingQueue;
++		std::size_t outgoingOffset;
++		std::size_t outgoingQueuedBytes;
+ 
+ 		std::unordered_map<std::string, MsgCallback> callbacks;
+ 		std::unordered_map<std::string, bool> blockingMap;
+diff --git a/spt/scripts/srctas_reader.cpp b/spt/scripts/srctas_reader.cpp
+index ecac3a8..32d63c5 100644
+--- a/spt/scripts/srctas_reader.cpp
++++ b/spt/scripts/srctas_reader.cpp
+@@ -226,7 +226,16 @@ namespace scripts
+ 		std::ostringstream os;
+ 		tickTime = spt_tickrate.GetTickrate();
+ 		float fps = 1.0f / tickTime * playbackSpeed;
+-		os << "host_framerate " << tickTime << "; fps_max " << fps;
++		// fps_max is FCVAR_NOT_CONNECTED in Portal, so a console assignment is
++		// rejected whenever a map is already active. Set it directly (the same
++		// path as spt_cvar), while leaving host_framerate in the script's normal
++		// during-load command sequence.
++		ConVar* fpsMax = g_pCVar ? g_pCVar->FindVar("fps_max") : nullptr;
++		if (fpsMax)
++			fpsMax->SetValue(fps);
++		else
++			DevWarning("Unable to set fps_max for TAS playback.\n");
++		os << "host_framerate " << tickTime;
+ 		currentScript.AddDuringLoadCmd(os.str());
+ 	}
+ 
+diff --git a/spt/scripts/srctas_reader.hpp b/spt/scripts/srctas_reader.hpp
+index 636d6a4..0680baa 100644
+--- a/spt/scripts/srctas_reader.hpp
++++ b/spt/scripts/srctas_reader.hpp
+@@ -25,6 +25,9 @@ namespace scripts
+ 		int GetCurrentTick();
+ 		int GetCurrentScriptLength();
+ 		bool IsExecutingScript();
++		// Interactive TAS playback shares the file player's initialization so
++		// both paths begin with identical TAS cvars and released key states.
++		void ResetConvars();
+ 
+ 	private:
+ 		bool iterationFinished;
+@@ -54,8 +57,6 @@ namespace scripts
+ 		bool ParseLine();
+ 		void SetNewLine();
+ 		void ReplaceVariables();
+-		void ResetConvars();
+-
+ 		void InitPropertyHandlers();
+ 		void ParseProps();
+ 		void ParseProp();

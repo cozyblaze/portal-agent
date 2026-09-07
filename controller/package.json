@@ -1,0 +1,11 @@
+{
+  "name": "portal-spt-control",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "manual": "node scripts/manual-test.mjs",
+    "test": "node index.test.mjs"
+  }
+}
